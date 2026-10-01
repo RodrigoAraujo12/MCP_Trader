@@ -8,6 +8,8 @@ propósito: a fase 1 é só leitura e nenhum código pode enviar ordens.
 from __future__ import annotations
 
 import time as _time
+from collections.abc import Callable
+from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
 
@@ -129,6 +131,11 @@ class FakeMT5:
         zero_tick_symbols: set[str] | None = None,
         rates_fail_times: int = 0,
         connect_after_polls: int = 0,
+        server: str = "Exness-MT5Trial",
+        maxbars: int = 100_000,
+        tradeapi_disabled: bool = False,
+        now: Callable[[], float] | None = None,
+        tick_age_s: dict[str, float] | None = None,
     ) -> None:
         # Copia as constantes do módulo para a instância (para `mt5.TIMEFRAME_H1` etc.).
         for key, value in globals().items():
@@ -147,7 +154,15 @@ class FakeMT5:
         self.zero_tick_symbols: set[str] = set(zero_tick_symbols or ())
         self.rates_fail_times = rates_fail_times
         self.connect_after_polls = connect_after_polls
+        self.server = server
+        self.maxbars = maxbars
+        self.tradeapi_disabled = tradeapi_disabled
+        # Relógio dos ticks (epoch UTC); os testes o alinham ao relógio do cliente.
+        self.now: Callable[[], float] = now or _time.time
+        # Idade (s) do último tick por símbolo; ausente = tick de agora.
+        self.tick_age_s: dict[str, float] = dict(tick_age_s or {})
         self.rates_calls = 0
+        self.range_calls: list[tuple[Any, ...]] = []
         self.terminal_polls = 0
         self.shutdown_calls = 0
         self.initialized = False
@@ -180,7 +195,14 @@ class FakeMT5:
             return None
         self.terminal_polls += 1
         connected = self.connected and self.terminal_polls > self.connect_after_polls
-        return Record(connected=connected, trade_allowed=True, name="MetaTrader 5 (fake)", build=5000)
+        return Record(
+            connected=connected,
+            trade_allowed=False,
+            tradeapi_disabled=self.tradeapi_disabled,
+            maxbars=self.maxbars,
+            name="MetaTrader 5 (fake)",
+            build=5000,
+        )
 
     def account_info(self) -> Record | None:
         if not self.initialized:
@@ -195,7 +217,7 @@ class FakeMT5:
             margin_free=self.balance,
             margin_level=0.0,
             currency=self.currency,
-            server="Exness-MT5Trial",
+            server=self.server,
             company="Exness",
             name="Conta Teste",
         )
@@ -226,8 +248,8 @@ class FakeMT5:
         s = self.symbols[name]
         if name in self.zero_tick_symbols:
             return Record(time=0, bid=0.0, ask=0.0, last=0.0, volume=0, time_msc=0, flags=0, volume_real=0.0)
-        now = int(_time.time())
-        return Record(time=now, bid=s.bid, ask=s.ask, last=0.0, volume=0, time_msc=now * 1000, flags=6, volume_real=0.0)
+        msc = int((self.now() - self.tick_age_s.get(name, 0.0)) * 1000)
+        return Record(time=msc // 1000, bid=s.bid, ask=s.ask, last=0.0, volume=0, time_msc=msc, flags=6, volume_real=0.0)
 
     # --- dados -----------------------------------------------------------
     def copy_rates_from_pos(self, symbol: str, timeframe: int, start_pos: int, count: int):
@@ -238,12 +260,23 @@ class FakeMT5:
         if not self.initialized or symbol not in self.rates:
             self._last_error = (-4, "Terminal: Not found")
             return None
+        if count >= self.maxbars:  # como no terminal real: pedir maxbars ou mais falha
+            self._last_error = (-2, "Terminal: Invalid params")
+            return None
         data = self.rates[symbol]
         end = len(data) - start_pos
         if end <= 0:
             return np.array([], dtype=RATES_DTYPE)
         begin = max(0, end - count)
         return data[begin:end].copy()
+
+    def copy_rates_range(self, symbol: str, timeframe: int, date_from: datetime, date_to: datetime):
+        self.range_calls.append((symbol, timeframe, date_from, date_to))
+        if not self.initialized:
+            return None
+        data = self.rates.get(symbol, np.array([], dtype=RATES_DTYPE))
+        lo, hi = int(date_from.timestamp()), int(date_to.timestamp())
+        return data[(data["time"] >= lo) & (data["time"] <= hi)].copy()
 
     # --- cálculos --------------------------------------------------------
     def order_calc_profit(self, action: int, symbol: str, volume: float, price_open: float, price_close: float):

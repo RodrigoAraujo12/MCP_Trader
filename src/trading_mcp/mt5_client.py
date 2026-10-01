@@ -8,12 +8,12 @@ import re
 import threading
 import time
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
 
-from trading_mcp import risk
+from trading_mcp import risk, tempo
 from trading_mcp.config import Settings
 
 log = logging.getLogger(__name__)
@@ -45,6 +45,7 @@ _ALLOWED_CALLS = frozenset(
         "symbol_info_tick",
         "symbol_select",
         "copy_rates_from_pos",
+        "copy_rates_range",
         "order_calc_profit",
         "order_calc_margin",
         "positions_get",
@@ -57,9 +58,14 @@ _TICK_ATTEMPTS = 3
 _TICK_RETRY_S = 0.3
 _RATES_ATTEMPTS = 3
 _RATES_RETRY_S = 0.5
-_WEEKEND_WARNING = (
-    "Mercado provavelmente fechado (fim de semana): esta é a última cotação disponível; veja horario_servidor."
-)
+# Cotação com até esta idade é "atual". Índices e forex têm ticks a cada poucos segundos na sessão.
+_FRESH_S = 60.0
+# Tick mais adiantado que isso em relação ao relógio UTC indica servidor fora de UTC (ou relógio errado).
+_FUTURE_TOLERANCE_S = 60.0
+# Tick mais antigo que isso não é comparado com a semana anterior.
+_MAX_LOOKBACK = timedelta(days=7)
+
+ACCOUNT_MODES = {"ACCOUNT_TRADE_MODE_DEMO": "demo", "ACCOUNT_TRADE_MODE_CONTEST": "concurso", "ACCOUNT_TRADE_MODE_REAL": "real"}
 
 
 class MT5Error(Exception):
@@ -71,7 +77,11 @@ class SymbolNotFoundError(MT5Error):
 
 
 class _ReadOnlyModule:
-    """Proxy do módulo MetaTrader5: só expõe funções de leitura e constantes MAIÚSCULAS."""
+    """Proxy do módulo MetaTrader5: só expõe funções de leitura e constantes MAIÚSCULAS.
+
+    Evita chamadas acidentais neste código; não é barreira de segurança (o módulo original
+    continua acessível a quem importá-lo diretamente).
+    """
 
     __slots__ = ("_raw",)
 
@@ -102,16 +112,6 @@ def _guard(func: Callable[..., Any]) -> Callable[..., Any]:
     return wrapper
 
 
-def _fmt_time(epoch: int | float) -> str:
-    """Formata um epoch do MT5 (que já representa o horário do servidor)."""
-    return datetime.fromtimestamp(int(epoch), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _is_weekend(now: datetime) -> bool:
-    wd = now.weekday()  # segunda=0
-    return wd == 5 or (wd == 6 and now.hour < 21) or (wd == 4 and now.hour >= 21)
-
-
 class MT5Client:
     """Acesso de leitura ao MT5; toda chamada ao módulo é serializada por um RLock."""
 
@@ -132,6 +132,14 @@ class MT5Client:
         self._lock = threading.RLock()
         self._initialized = False
         self._symbol_cache: dict[str, str] = {}
+        # Estado observado na última verificação (ensure_connected).
+        self._connected = False
+        self._identity: tuple[Any, Any] | None = None  # (login, servidor) da última verificação
+        # Com a conta fixada no .env: (login, servidor) da primeira conexão; não é zerado ao reconectar.
+        self._pinned_identity: tuple[Any, Any] | None = None
+        self._trade_mode: Any = None
+        self._account_snapshot: Any = None  # account_info() da última verificação
+        self._terminal_maxbars: int | None = None
 
     # ------------------------------------------------------------------ conexão
     def _module(self) -> Any:
@@ -165,9 +173,26 @@ class MT5Client:
         except Exception:  # noqa: BLE001 - só para compor a mensagem
             return "desconhecido"
 
+    def _shutdown_quietly(self) -> None:
+        try:
+            self._call("shutdown")
+        except MT5Error:
+            pass
+
+    @property
+    def account_pinned(self) -> bool:
+        """True se o .env fixa a conta esperada (MT5_LOGIN e/ou MT5_SERVER)."""
+        return self._settings.mt5_login is not None or bool(self._settings.mt5_server)
+
     @_guard
     def ensure_connected(self) -> None:
-        """Inicializa o MT5 se necessário (ou se o terminal foi fechado/reiniciado)."""
+        """Inicializa o MT5 se necessário e, a cada uso, confere conexão e conta logada.
+
+        Troca de conta no terminal: com MT5_LOGIN/MT5_SERVER no .env, as ferramentas são
+        bloqueadas até voltar à conta configurada (sem relogar sozinho); sem eles, o cache
+        de símbolos é limpo e a nova conta passa a ser usada. Perda de conexão depois de
+        conectado não gera erro: fica registrada e aparece no estado das cotações.
+        """
         with self._lock:
             s = self._settings
             if s.errors:
@@ -182,15 +207,16 @@ class MT5Client:
                 )
             self._module()
             if self._initialized:
-                if self._call("terminal_info") is not None:
+                info = self._call("terminal_info")
+                if info is not None:
+                    self._update_terminal(info)
+                    self._check_account(initializing=False)
                     return
                 log.warning("Terminal MT5 não responde; reconectando")
-                try:
-                    self._call("shutdown")
-                except MT5Error:
-                    pass
+                self._shutdown_quietly()
             self._initialized = False
             self._symbol_cache.clear()
+            self._identity = None
             kwargs: dict[str, Any] = {}
             if s.mt5_path:
                 kwargs["path"] = s.mt5_path
@@ -222,19 +248,74 @@ class MT5Client:
                         "Verifique a internet e o login da conta."
                     )
                 self._sleep(_WARMUP_STEP_S)
-            if s.mt5_login is not None:
-                acc = self._call("account_info")
-                actual = getattr(acc, "login", None)
-                if actual != s.mt5_login:
-                    try:
-                        self._call("shutdown")
-                    except MT5Error:
-                        pass
-                    raise MT5Error(
-                        f"O terminal MT5 está logado na conta {actual}, diferente de MT5_LOGIN ({s.mt5_login}). "
-                        "Conexão encerrada; confira MT5_PATH, MT5_LOGIN e MT5_SERVER."
-                    )
+            self._update_terminal(info)
+            self._check_account(initializing=True)
             self._initialized = True
+
+    def _update_terminal(self, info: Any) -> None:
+        was_connected = self._connected
+        self._connected = bool(getattr(info, "connected", False))
+        if was_connected and not self._connected:
+            log.warning("Terminal MT5 perdeu a conexão com a corretora")
+        maxbars = getattr(info, "maxbars", None)
+        if isinstance(maxbars, int) and maxbars > 1:
+            self._terminal_maxbars = maxbars
+
+    def _check_account(self, *, initializing: bool) -> None:
+        """Confere a conta logada contra o .env e detecta troca de conta.
+
+        Com a conta fixada (mesmo que só por MT5_LOGIN ou só por MT5_SERVER), o par
+        (login, servidor) da primeira conexão fica congelado, inclusive depois de o terminal
+        reiniciar: qualquer troca bloqueia.
+        """
+        acc = self._call("account_info")
+        if acc is None:
+            if initializing:
+                self._shutdown_quietly()
+            raise MT5Error(
+                f"O terminal MT5 não informou a conta logada ({self._last_error()}). "
+                "Confira se há uma conta conectada no terminal."
+            )
+        s = self._settings
+        login, server = getattr(acc, "login", None), getattr(acc, "server", None)
+        problems: list[str] = []
+        if s.mt5_login is not None and login != s.mt5_login:
+            problems.append(f"na conta {login}, diferente de MT5_LOGIN ({s.mt5_login})")
+        if s.mt5_server and server != s.mt5_server:
+            problems.append(f"no servidor {server}, diferente de MT5_SERVER ({s.mt5_server})")
+        identity = (login, server)
+        frozen = self._pinned_identity
+        if not problems and frozen is not None and identity != frozen:
+            problems.append(
+                f"na conta {login} do servidor {server}, diferente da conectada no início "
+                f"({frozen[0]} em {frozen[1]})"
+            )
+        if problems:
+            if initializing:
+                self._shutdown_quietly()
+                action = "Conexão encerrada; confira MT5_PATH, MT5_LOGIN e MT5_SERVER."
+            else:
+                action = (
+                    "A conta foi trocada no terminal: as ferramentas ficam bloqueadas até ele voltar "
+                    "para a conta original."
+                )
+            raise MT5Error(f"O terminal MT5 está logado {' e '.join(problems)}. {action}")
+        if self._identity is not None and identity != self._identity:
+            log.warning("Conta do terminal mudou de %s para %s; cache de símbolos limpo", self._identity, identity)
+            self._symbol_cache.clear()
+        self._identity = identity
+        if self.account_pinned and self._pinned_identity is None:
+            self._pinned_identity = identity
+        self._trade_mode = getattr(acc, "trade_mode", None)
+        self._account_snapshot = acc
+
+    def _source(self) -> str:
+        return f"MetaTrader 5 ({self._identity[1]})" if self._identity else "MetaTrader 5"
+
+    def _account_kind(self) -> str:
+        mt5 = self._module()
+        modes = {getattr(mt5, const): kind for const, kind in ACCOUNT_MODES.items()}
+        return modes.get(self._trade_mode, "desconhecido")
 
     # ------------------------------------------------------------------ símbolos
     def _all_symbols(self) -> list[Any]:
@@ -363,9 +444,64 @@ class MT5Client:
     def _tick_valid(tick: Any) -> bool:
         return tick is not None and tick.time != 0 and tick.bid > 0 and tick.ask > 0
 
+    def _traded_between(self, resolved: str, start: datetime, end: datetime) -> bool | None:
+        """Houve candle M1 entre ``start`` e ``end``? None se o histórico não respondeu."""
+        try:
+            data = self._call("copy_rates_range", resolved, self._module().TIMEFRAME_M1, start, end)
+        except MT5Error as exc:
+            log.warning("copy_rates_range falhou para %s: %s", resolved, exc)
+            return None
+        if data is None:
+            return None
+        return len(data) > 0
+
+    def _freshness(self, resolved: str, tick_time: datetime, now: datetime) -> tuple[str, str | None]:
+        """Estado da cotação a partir da idade do tick, da conexão e da semana anterior.
+
+        Para separar mercado fechado de atraso, confere se o ativo negociou na semana anterior
+        durante o mesmo intervalo que hoje está sem ticks (do último tick até agora).
+        """
+        age = (now - tick_time).total_seconds()
+        if not self._connected:
+            return (
+                "desconectado",
+                f"O terminal está sem conexão com a corretora: esta é a última cotação recebida, "
+                f"de {tempo.describe_age(age)} atrás.",
+            )
+        if age < -_FUTURE_TOLERANCE_S:
+            return (
+                "horario_inconsistente",
+                f"A cotação está {tempo.describe_age(age)} à frente do relógio UTC deste computador: o servidor "
+                "pode não usar UTC ou o relógio do Windows está errado. Não use os horários sem conferir.",
+            )
+        if age <= _FRESH_S:
+            return "atual", None
+        ago = tempo.describe_age(age)
+        if now - tick_time > _MAX_LOOKBACK:
+            return "antigo", f"Última cotação há {ago}: o ativo não negocia há mais de uma semana."
+        week = timedelta(days=7)
+        # Candles M1 são marcados pela abertura do minuto: o primeiro candle inteiro sem ticks hoje
+        # começa no minuto seguinte ao do último tick.
+        gap_start = tick_time.replace(second=0, microsecond=0) + timedelta(minutes=1)
+        traded = self._traded_between(resolved, gap_start - week, now - week)
+        if traded is False:
+            return (
+                "mercado_fechado_provavel",
+                f"Última cotação há {ago}. No mesmo intervalo da semana passada também não houve negociação: "
+                "provável pausa diária, fim de semana ou horário fora da sessão do ativo (ou feriado na "
+                "semana passada).",
+            )
+        if traded is True:
+            return (
+                "atrasado",
+                f"Última cotação há {ago}, mas no mesmo intervalo da semana passada houve negociação: possível "
+                "feriado, atraso ou problema de conexão. Não trate como preço atual.",
+            )
+        return "antigo", f"Última cotação há {ago}; não foi possível verificar o horário de negociação do ativo."
+
     @_guard
     def quote(self, symbol: str) -> dict:
-        """Cotação atual com spread em preço, pontos e (forex) pips."""
+        """Cotação com spread, horário (UTC, São Paulo, Nova York), idade e estado."""
         with self._lock:
             resolved = self.resolve_symbol(symbol)
             info = self._info(resolved)
@@ -388,41 +524,85 @@ class MT5Client:
             if self._is_forex(info):
                 pip = risk.pip_size(info.point, digits)
                 spread_pips = round(spread / pip, 1) if pip else None
+            time_msc = getattr(tick, "time_msc", 0) or 0
+            tick_time = tempo.from_epoch(time_msc / 1000 if time_msc else tick.time)
+            now = self._now_utc()
+            age = (now - tick_time).total_seconds()
+            estado, aviso = self._freshness(resolved, tick_time, now)
             result = {
                 "simbolo": resolved,
+                "descricao": info.description,
+                "categoria": info.path,
+                "moeda": info.currency_profit,
+                "fonte": self._source(),
                 "bid": round(tick.bid, digits),
                 "ask": round(tick.ask, digits),
                 "spread_preco": round(spread, digits),
                 "spread_pontos": spread_points,
                 "spread_pips": spread_pips,
-                "horario_servidor": _fmt_time(tick.time),
+                "horario": tempo.exibicao(tick_time),
+                # Idade negativa dentro da tolerância = relógio do PC um pouco atrás do servidor.
+                "idade_s": round(age if estado == "horario_inconsistente" else max(age, 0.0), 1),
+                "estado": estado,
+                "coletado_utc": tempo.iso_utc(now),
             }
-            if "crypto" not in str(getattr(info, "path", "") or "").lower() and _is_weekend(self._now_utc()):
-                result["aviso"] = _WEEKEND_WARNING
+            if aviso:
+                result["aviso"] = aviso
             return result
+
+    def _bars_limit(self) -> int:
+        """Máximo de candles por chamada: MAX_BARS e o limite do terminal (pedir maxbars falha)."""
+        limit = self._settings.max_bars
+        if self._terminal_maxbars:
+            limit = min(limit, self._terminal_maxbars - 1)
+        return max(1, limit)
 
     @_guard
     def rates(self, symbol: str, timeframe: str, count: int, include_current: bool = True) -> pd.DataFrame:
-        """Candles do mais antigo ao mais novo; `time` em horário do servidor (naive)."""
+        """Candles do mais antigo ao mais novo, com ``time`` em UTC.
+
+        ``df.attrs``: ``ultimo_em_formacao`` (o último candle ainda está aberto, pelo horário e não
+        pela posição), ``horario_inconsistente`` (último candle abre depois de agora) e ``conectado``
+        (terminal conectado à corretora; sem conexão os candles recentes podem faltar). Sem o candle
+        atual, só sai o candle que de fato está aberto: na pausa diária ou no fim de semana o último
+        candle já fechou e é mantido.
+        """
         tf_key = (timeframe or "").strip().upper()
         if tf_key not in TIMEFRAMES:
             raise ValueError(f"Timeframe inválido: '{timeframe}'. Válidos: {', '.join(TIMEFRAMES)}.")
-        count = max(1, min(int(count), self._settings.max_bars))
         with self._lock:
             resolved = self.resolve_symbol(symbol)
+            count = max(1, min(int(count), self._bars_limit()))
+            # O candle extra (para descartar um aberto) só esbarra no limite do terminal, não no MAX_BARS.
+            terminal_limit = self._terminal_maxbars - 1 if self._terminal_maxbars else count + 1
+            request = min(count + (0 if include_current else 1), terminal_limit)
             tf = getattr(self._module(), TIMEFRAMES[tf_key])
             data = None
             for attempt in range(_RATES_ATTEMPTS):
                 if attempt:
                     self._sleep(_RATES_RETRY_S)
-                data = self._call("copy_rates_from_pos", resolved, tf, 0 if include_current else 1, count)
+                data = self._call("copy_rates_from_pos", resolved, tf, 0, request)
                 if data is not None and len(data) > 0:
                     break
             else:
                 raise MT5Error(f"Sem candles para {resolved} em {tf_key}: {self._last_error()}")
+            connected = self._connected
         df = pd.DataFrame(data)[_RATE_COLUMNS]
-        df["time"] = pd.to_datetime(df["time"], unit="s")
-        return df.reset_index(drop=True)
+        df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+        now = self._now_utc()
+        raw_last_open = df["time"].iloc[-1].to_pydatetime()
+        # Candle aberto depois de agora: o servidor não está em UTC (ou o relógio do Windows está errado).
+        future = (raw_last_open - now).total_seconds() > _FUTURE_TOLERANCE_S
+        if not include_current and tempo.bar_in_progress(raw_last_open, tf_key, now):
+            df = df.iloc[:-1]
+            if df.empty:
+                raise MT5Error(f"Sem candles fechados para {resolved} em {tf_key}.")
+        df = df.tail(count).reset_index(drop=True)
+        last_open = df["time"].iloc[-1].to_pydatetime()
+        df.attrs["ultimo_em_formacao"] = tempo.bar_in_progress(last_open, tf_key, now)
+        df.attrs["horario_inconsistente"] = future
+        df.attrs["conectado"] = connected
+        return df
 
     @_guard
     def loss_per_lot(self, symbol: str, entry: float, stop: float) -> tuple[float, str]:
@@ -461,16 +641,8 @@ class MT5Client:
         """Resumo da conta (sem senha e sem nome do titular)."""
         with self._lock:
             self.ensure_connected()
-            mt5 = self._module()
-            a = self._call("account_info")
-            if a is None:
-                raise MT5Error(f"Não foi possível ler a conta: {self._last_error()}")
-            modes = {
-                mt5.ACCOUNT_TRADE_MODE_DEMO: "demo",
-                mt5.ACCOUNT_TRADE_MODE_CONTEST: "concurso",
-                mt5.ACCOUNT_TRADE_MODE_REAL: "real",
-            }
-            kind = modes.get(a.trade_mode, "desconhecido")
+            a = self._account_snapshot  # a mesma leitura que acabou de ser conferida
+            kind = self._account_kind()
             return {
                 "login": a.login,
                 "servidor": a.server,
@@ -484,6 +656,23 @@ class MT5Client:
                 "alavancagem": a.leverage,
                 "tipo_conta": kind,
                 "is_demo": kind == "demo",
+                "conectado": self._connected,
+            }
+
+    @_guard
+    def terminal(self) -> dict:
+        """Estado do terminal, incluindo as travas de negociação automática."""
+        with self._lock:
+            self.ensure_connected()
+            t = self._call("terminal_info")
+            if t is None:
+                raise MT5Error(f"Não foi possível ler o terminal: {self._last_error()}")
+            return {
+                "conectado": bool(getattr(t, "connected", False)),
+                "algo_trading_ativo": bool(getattr(t, "trade_allowed", False)),
+                "negociacao_via_python_desativada": bool(getattr(t, "tradeapi_disabled", False)),
+                "build": getattr(t, "build", None),
+                "max_barras_grafico": getattr(t, "maxbars", None),
             }
 
     @_guard
@@ -508,7 +697,7 @@ class MT5Client:
                     "take_profit": p.tp,
                     "lucro": p.profit,
                     "swap": p.swap,
-                    "abertura": _fmt_time(p.time),
+                    "abertura": tempo.exibicao(tempo.from_epoch(p.time)),
                 }
                 for p in items
             ]

@@ -16,7 +16,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import ToolAnnotations
 from pydantic import Field
 
-from trading_mcp import indicators, risk
+from trading_mcp import indicators, risk, tempo
 from trading_mcp.config import Settings, load_settings
 from trading_mcp.mt5_client import MT5Client, MT5Error
 from trading_mcp.sec_edgar import SecEdgarClient, SecEdgarError
@@ -36,8 +36,14 @@ Somente leitura: não existe tool para enviar ordens.
 Regras de uso:
 - Para tamanho de lote, use SEMPRE a tool `tamanho_posicao` em vez de calcular manualmente: ela usa a
   especificação real do contrato na corretora (valor do tick, lote mínimo, passo).
-- Horários de candles e cotações estão no horário do servidor da corretora, não no horário local.
-- Quando o candle atual é incluído, o último candle ainda está se formando e os indicadores mudam até ele fechar.
+- Horários estão em UTC (o servidor da Exness usa UTC; conferido no terminal). As tools também trazem
+  São Paulo e Nova York; para converter outros horários use as diferenças informadas, que mudam com o
+  horário de verão dos EUA.
+- Cotação: só apresente como preço atual quando `estado` = "atual". Nos demais estados, informe a idade
+  e o aviso; não misture cotações de horários diferentes como se fossem simultâneas.
+- `em_formacao` diz se o último candle ainda está aberto; os indicadores mudam até ele fechar.
+- Os símbolos são CFDs da corretora (ex.: USTECm acompanha o Nasdaq 100, mas não é o índice): cite o
+  símbolo exato.
 - Indicadores seguem a convenção do TradingView. O ATR e o MACD nativos do MT5 usam médias simples
   (ATR = média simples do true range; linha de sinal do MACD = média simples), então podem diferir do gráfico do MT5.
 - `tamanho_posicao` não inclui comissão nem swap; contas Raw Spread/Zero cobram comissão por lote.
@@ -67,6 +73,22 @@ def _round(value: float, digits: int) -> float:
     return round(float(value), digits)
 
 
+def _candle_warnings(df: Any) -> list[str]:
+    """Avisos sobre a confiabilidade dos candles devolvidos por MT5Client.rates."""
+    warnings: list[str] = []
+    if not df.attrs.get("conectado", True):
+        warnings.append(
+            "Terminal sem conexão com a corretora: os candles mais recentes podem estar faltando e o "
+            "último pode não ser atualizado."
+        )
+    if df.attrs.get("horario_inconsistente"):
+        warnings.append(
+            "O último candle abre depois do horário UTC atual: o servidor pode não usar UTC ou o relógio "
+            "do Windows está errado. Não use os horários sem conferir."
+        )
+    return warnings
+
+
 def create_server(
     settings: Settings | None = None,
     mt5_client: MT5Client | None = None,
@@ -82,7 +104,10 @@ def create_server(
     def cotacao(
         simbolo: Annotated[str, Field(description="Símbolo, ex.: EURUSD, XAUUSD, AAPL")],
     ) -> dict[str, Any]:
-        """Cotação atual do símbolo: bid, ask e spread (em pontos e, no forex, em pips)."""
+        """Última cotação do símbolo: bid, ask, spread, horário (UTC/São Paulo/Nova York), idade e estado.
+
+        Só é preço atual quando `estado` = "atual".
+        """
         with _tool_errors():
             return mt5.quote(simbolo)
 
@@ -102,7 +127,8 @@ def create_server(
             digits = mt5.symbol_spec(resolved)["digitos"]
             df = mt5.rates(resolved, timeframe, quantidade, include_current=incluir_candle_atual)
             fmt = f"{{:.{digits}f}}"
-            lines = ["horario,abertura,maxima,minima,fechamento,volume_ticks"]
+            last = df["time"].iloc[-1].to_pydatetime()
+            lines = ["horario_utc,abertura,maxima,minima,fechamento,volume_ticks"]
             lines += [
                 ",".join(
                     [
@@ -118,11 +144,12 @@ def create_server(
             ]
             first_open = float(df["open"].iloc[0])
             last_close = float(df["close"].iloc[-1])
-            return {
+            result: dict[str, Any] = {
                 "simbolo": resolved,
                 "timeframe": timeframe.upper(),
-                "horario": "servidor da corretora",
-                "candle_atual_incluido": incluir_candle_atual,
+                "fuso_horario": "UTC",
+                "diferenca_utc_no_ultimo_candle": tempo.offsets(last),
+                "ultimo_candle": {**tempo.exibicao(last), "em_formacao": df.attrs["ultimo_em_formacao"]},
                 "quantidade": len(df),
                 "resumo": {
                     "maxima": _round(df["high"].max(), digits),
@@ -131,6 +158,10 @@ def create_server(
                 },
                 "candles_csv": "\n".join(lines),
             }
+            warnings = _candle_warnings(df)
+            if warnings:
+                result["avisos"] = warnings
+            return result
 
     @server.tool(annotations=READ_ONLY)
     def indicadores(
@@ -162,12 +193,14 @@ def create_server(
                     f"Histórico disponível ({len(df)} candles) menor que o recomendado ({wanted}); "
                     "médias longas podem diferir levemente das plataformas de gráfico."
                 )
-            if incluir_candle_atual:
-                notes.append("O último candle ainda está aberto: os valores mudam até ele fechar.")
+            forming = df.attrs["ultimo_em_formacao"]
+            if forming:
+                notes.append("O último candle ainda está em formação: os valores mudam até ele fechar.")
+            notes += _candle_warnings(df)
             return {
                 "simbolo": resolved,
                 "timeframe": timeframe.upper(),
-                "candle_referencia": df["time"].iloc[-1].strftime("%Y-%m-%d %H:%M"),
+                "candle_referencia": {**tempo.exibicao(df["time"].iloc[-1].to_pydatetime()), "em_formacao": forming},
                 "fechamento": _round(df["close"].iloc[-1], digits),
                 "candles_usados": len(df),
                 "indicadores": indicators.compute(df, specs, digits=digits),
@@ -201,6 +234,11 @@ def create_server(
                 )
             account = mt5.account()
             balance = saldo if saldo is not None else float(account["saldo"])
+            pre_warnings: list[str] = []
+            if saldo is None and not account["is_demo"]:
+                pre_warnings.append(f"Saldo da conta conectada, que NÃO é demo (tipo: {account['tipo_conta']}).")
+            if not account["conectado"]:
+                pre_warnings.append("Terminal sem conexão com a corretora: saldo e cotação podem estar desatualizados.")
             loss, side = mt5.loss_per_lot(resolved, entrada, stop)
             size = risk.position_size(
                 balance=balance,
@@ -210,7 +248,7 @@ def create_server(
                 volume_max=spec["volume_max"],
                 volume_step=spec["volume_step"],
             )
-            warnings = list(size.warnings)
+            warnings = pre_warnings + list(size.warnings)
 
             digits = spec["digitos"]
             stop_distance: dict[str, Any] = {
@@ -240,6 +278,12 @@ def create_server(
             except MT5Error:
                 warnings.append("Sem cotação atual: não foi possível estimar o efeito do spread.")
             else:
+                if quote["estado"] != "atual":
+                    detail = f" {quote['aviso']}" if quote.get("aviso") else ""
+                    warnings.append(
+                        f"Spread e conferência da entrada usam uma cotação não atual ({quote['estado']}, "
+                        f"idade {tempo.describe_age(quote['idade_s'])}).{detail}"
+                    )
                 mid = (quote["bid"] + quote["ask"]) / 2
                 if abs(entrada - mid) / mid * 100 > ENTRY_DISTANCE_WARNING_PCT:
                     warnings.append(
@@ -286,15 +330,25 @@ def create_server(
 
     @server.tool(annotations=READ_ONLY)
     def info_conta() -> dict[str, Any]:
-        """Saldo, margem e posições abertas da conta conectada no MetaTrader 5 (somente leitura)."""
+        """Saldo, margem, posições abertas e travas de negociação do terminal (somente leitura)."""
         with _tool_errors():
             account = mt5.account()
-            result: dict[str, Any] = {"conta": account, "posicoes": mt5.positions()}
+            result: dict[str, Any] = {"conta": account, "terminal": mt5.terminal(), "posicoes": mt5.positions()}
+            warnings: list[str] = []
             if not account["is_demo"]:
-                result["aviso"] = (
+                warnings.append(
                     "ATENÇÃO: a conta conectada NÃO é demo. Este servidor deveria apontar para uma "
                     "instalação do MT5 logada apenas na conta demo (MT5_PATH no .env)."
                 )
+            if not mt5.account_pinned:
+                warnings.append(
+                    "Conta não fixada no .env (MT5_LOGIN/MT5_SERVER): uma troca de conta no terminal "
+                    "não seria bloqueada."
+                )
+            if not account["conectado"]:
+                warnings.append("Terminal sem conexão com a corretora: valores podem estar desatualizados.")
+            if warnings:
+                result["avisos"] = warnings
             return result
 
     @server.tool(annotations=READ_ONLY)
@@ -318,7 +372,10 @@ def create_server(
 
 
 def main() -> None:
-    # stdout é o canal JSON-RPC: logs vão para stderr.
+    # stdout é o canal JSON-RPC: logs vão para stderr, em UTF-8 (o Claude Desktop lê o log assim;
+    # no Windows o padrão seria cp1252 e os acentos sairiam trocados).
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     settings = load_settings()
     logger.info("Configuração: %s", settings.env_file or "nenhum .env encontrado (usando só variáveis de ambiente)")

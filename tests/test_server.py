@@ -81,8 +81,8 @@ class FakeSec:
         return {"ticker": ticker.upper(), "empresa": "Apple Inc.", "cik": 320193}
 
 
-def _server(fake: FakeMT5 | None = None, sec: Any | None = None):
-    settings = Settings(max_bars=5_000)
+def _server(fake: FakeMT5 | None = None, sec: Any | None = None, **settings_kwargs: Any):
+    settings = Settings(max_bars=5_000, **settings_kwargs)
     return create_server(settings, MT5Client(settings, mt5_module=fake or _fake_mt5()), sec or FakeSec())
 
 
@@ -126,7 +126,11 @@ async def test_historico_shape_and_order() -> None:
         data = _payload(await client.call_tool("historico", {"simbolo": "EURUSD", "quantidade": 50}))
     assert data["simbolo"] == "EURUSDm"
     header, *rows = data["candles_csv"].splitlines()
-    assert header == "horario,abertura,maxima,minima,fechamento,volume_ticks"
+    assert header == "horario_utc,abertura,maxima,minima,fechamento,volume_ticks"
+    assert data["fuso_horario"] == "UTC"
+    assert data["ultimo_candle"]["em_formacao"] is False  # candles do fake são de 2023
+    assert set(data["ultimo_candle"]) == {"utc", "sao_paulo", "nova_york", "em_formacao"}
+    assert set(data["diferenca_utc_no_ultimo_candle"]) == {"sao_paulo", "nova_york"}
     assert len(rows) == data["quantidade"] == 50
     cells = [r.split(",") for r in rows]
     assert all(len(c) == 6 for c in cells)
@@ -159,6 +163,8 @@ async def test_indicadores_default_list() -> None:
     assert set(data["indicadores"]) == {"RSI(14)", "MACD(12,26,9)", "EMA(20)", "EMA(50)", "ATR(14)"}
     assert 0 <= data["indicadores"]["RSI(14)"]["valor"] <= 100
     assert data["candles_usados"] > 0
+    assert data["candle_referencia"]["em_formacao"] is False
+    assert not any("formação" in n for n in data["observacoes"])
 
 
 @pytest.mark.anyio
@@ -275,12 +281,20 @@ async def test_tamanho_posicao_entry_equals_stop_is_tool_error() -> None:
 
 
 @pytest.mark.anyio
-async def test_info_conta_demo_has_no_warning() -> None:
+async def test_info_conta_pinned_demo_has_no_warning() -> None:
+    pinned = {"mt5_login": 12345678, "mt5_server": "Exness-MT5Trial", "mt5_path": "C:/MT5-Demo/terminal64.exe"}
+    async with Client(_server(**pinned)) as client:
+        data = _payload(await client.call_tool("info_conta", {}))
+    assert data["conta"]["is_demo"] is True and data["conta"]["conectado"] is True
+    assert "avisos" not in data
+    assert "senha" not in json.dumps(data).lower()
+
+
+@pytest.mark.anyio
+async def test_info_conta_unpinned_account_warns() -> None:
     async with Client(_server()) as client:
         data = _payload(await client.call_tool("info_conta", {}))
-    assert data["conta"]["is_demo"] is True
-    assert "aviso" not in data
-    assert "senha" not in json.dumps(data).lower()
+    assert any("não fixada" in w for w in data["avisos"])
 
 
 @pytest.mark.anyio
@@ -288,7 +302,72 @@ async def test_info_conta_real_account_warns() -> None:
     async with Client(_server(_fake_mt5(trade_mode=ACCOUNT_TRADE_MODE_REAL))) as client:
         data = _payload(await client.call_tool("info_conta", {}))
     assert data["conta"]["is_demo"] is False
-    assert "NÃO é demo" in data["aviso"]
+    assert any("NÃO é demo" in w for w in data["avisos"])
+
+
+@pytest.mark.anyio
+async def test_info_conta_shows_terminal_trading_locks() -> None:
+    async with Client(_server(_fake_mt5(tradeapi_disabled=True))) as client:
+        data = _payload(await client.call_tool("info_conta", {}))
+    assert data["terminal"]["negociacao_via_python_desativada"] is True
+    assert data["terminal"]["algo_trading_ativo"] is False
+
+
+@pytest.mark.anyio
+async def test_historico_and_indicadores_warn_when_disconnected() -> None:
+    fake = _fake_mt5()
+    async with Client(_server(fake)) as client:
+        await client.call_tool("cotacao", {"simbolo": "EURUSD"})
+        fake.connected = False
+        hist = _payload(await client.call_tool("historico", {"simbolo": "EURUSD", "quantidade": 5}))
+        ind = _payload(await client.call_tool("indicadores", {"simbolo": "EURUSD"}))
+    assert any("sem conexão" in w for w in hist["avisos"])
+    assert any("sem conexão" in n for n in ind["observacoes"])
+
+
+@pytest.mark.anyio
+async def test_indicadores_flags_forming_candle() -> None:
+    import time
+
+    n = 1500
+    start = int(time.time()) - (n - 1) * 3600 - 1800  # último H1 abriu há 30 min
+    fake = _fake_mt5()
+    fake.rates["EURUSDm"] = make_rates(_random_walk(n), start_time=start)
+    async with Client(_server(fake)) as client:
+        data = _payload(await client.call_tool("indicadores", {"simbolo": "EURUSD"}))
+        closed = _payload(
+            await client.call_tool("indicadores", {"simbolo": "EURUSD", "incluir_candle_atual": False})
+        )
+    assert data["candle_referencia"]["em_formacao"] is True
+    assert any("em formação" in n for n in data["observacoes"])
+    assert closed["candle_referencia"]["em_formacao"] is False
+
+
+@pytest.mark.anyio
+async def test_cotacao_reports_time_age_and_state() -> None:
+    async with Client(_server()) as client:
+        data = _payload(await client.call_tool("cotacao", {"simbolo": "EURUSD"}))
+    assert data["estado"] == "atual" and data["idade_s"] < 5
+    assert data["horario"]["utc"].endswith("Z") and "aviso" not in data
+
+
+@pytest.mark.anyio
+async def test_tamanho_posicao_warns_on_real_account_balance() -> None:
+    async with Client(_server(_fake_mt5(trade_mode=ACCOUNT_TRADE_MODE_REAL))) as client:
+        data = _payload(
+            await client.call_tool("tamanho_posicao", {"simbolo": "EURUSD", "entrada": 1.1, "stop": 1.098})
+        )
+    assert any("NÃO é demo" in w for w in data["avisos"])
+
+
+@pytest.mark.anyio
+async def test_tamanho_posicao_warns_on_stale_quote() -> None:
+    # Tick de 1 h atrás e nenhum candle na semana passada: estado "mercado_fechado_provavel".
+    async with Client(_server(_fake_mt5(tick_age_s={"EURUSDm": 3600}))) as client:
+        data = _payload(
+            await client.call_tool("tamanho_posicao", {"simbolo": "EURUSD", "entrada": 1.1, "stop": 1.098})
+        )
+    assert any("cotação não atual (mercado_fechado_provavel" in w for w in data["avisos"])
 
 
 @pytest.mark.anyio

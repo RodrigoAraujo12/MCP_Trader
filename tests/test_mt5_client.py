@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
@@ -39,6 +39,7 @@ class FakeClock:
 def make_client(fake: FakeMT5 | None = None, **settings) -> tuple[MT5Client, FakeMT5]:
     fake = fake or FakeMT5([make_symbol("EURUSD")])
     clock = FakeClock()
+    fake.now = lambda: clock.now.timestamp()  # ticks no mesmo relógio do cliente
     client = MT5Client(
         Settings(**settings), mt5_module=fake, sleep=clock.sleep, monotonic=clock.monotonic, now_utc=clock.now_utc
     )
@@ -197,7 +198,12 @@ def test_quote_forex_5_digits():
     assert q["spread_pontos"] == 12 and isinstance(q["spread_pontos"], int)
     assert q["spread_pips"] == pytest.approx(1.2)
     assert q["spread_preco"] == pytest.approx(0.00012)
-    assert len(q["horario_servidor"]) == 19 and q["horario_servidor"][4] == "-"
+    # 2026-09-30 12:00 UTC = 09:00 em São Paulo (UTC-3) e 08:00 em Nova York (EDT, UTC-4)
+    assert q["horario"] == {"utc": "2026-09-30T12:00:00Z", "sao_paulo": "2026-09-30 09:00:00",
+                            "nova_york": "2026-09-30 08:00:00"}
+    assert q["estado"] == "atual" and q["idade_s"] == 0.0 and "aviso" not in q
+    assert q["coletado_utc"] == "2026-09-30T12:00:00Z"
+    assert q["fonte"] == "MetaTrader 5 (Exness-MT5Trial)" and q["moeda"] == "USD"
 
 
 def test_quote_forex_3_digits():
@@ -234,8 +240,8 @@ def test_rates_dataframe_shape_and_dtypes():
     client, closes = rates_client()
     df = client.rates("EURUSD", "h1", 10)
     assert list(df.columns) == ["time", "open", "high", "low", "close", "tick_volume", "spread", "real_volume"]
-    assert str(df["time"].dtype).startswith("datetime64") and df["time"].dt.tz is None
-    assert df["time"].iloc[0] == pd.Timestamp(1_700_000_000, unit="s")
+    assert str(df["time"].dt.tz) == "UTC"
+    assert df["time"].iloc[0] == pd.Timestamp(1_700_000_000, unit="s", tz="UTC")
     assert df["time"].is_monotonic_increasing
     assert list(df.index) == list(range(10))
     assert df["close"].iloc[-1] == pytest.approx(closes[-1])
@@ -248,11 +254,84 @@ def test_rates_count_clamped_to_max_bars_and_min_one():
     assert len(client.rates("EURUSD", "H1", 0)) == 1
 
 
-def test_rates_exclude_current():
-    client, closes = rates_client()
+def _forming_client(n: int = 10):
+    """Candles H1 cujo último abriu há 30 min do relógio do cliente (ainda em formação)."""
+    closes = [1.10 + i * 0.001 for i in range(n)]
+    now = FakeClock().now
+    start = int(now.timestamp()) - (n - 1) * 3600 - 1800
+    fake = FakeMT5([make_symbol("EURUSD")], rates={"EURUSD": make_rates(closes, start_time=start)})
+    return make_client(fake)[0], closes
+
+
+def test_rates_exclude_current_drops_forming_candle():
+    client, closes = _forming_client()
     df = client.rates("EURUSD", "H1", 3, include_current=False)
     assert df["close"].iloc[-1] == pytest.approx(closes[-2])
-    assert len(df) == 3
+    assert len(df) == 3 and df.attrs["ultimo_em_formacao"] is False
+
+
+def test_rates_include_current_flags_forming_candle():
+    client, closes = _forming_client()
+    df = client.rates("EURUSD", "H1", 3)
+    assert df["close"].iloc[-1] == pytest.approx(closes[-1])
+    assert df.attrs["ultimo_em_formacao"] is True
+
+
+def test_rates_exclude_current_keeps_closed_candle_during_break():
+    # Candles antigos (2023): na pausa/fim de semana o último candle já fechou e não é descartado.
+    client, closes = rates_client()
+    df = client.rates("EURUSD", "H1", 3, include_current=False)
+    assert df["close"].iloc[-1] == pytest.approx(closes[-1])
+    assert len(df) == 3 and df.attrs["ultimo_em_formacao"] is False
+
+
+def test_rates_exclude_current_at_max_bars_returns_full_count():
+    # O candle extra pedido para descartar o aberto não pode ser cortado pelo MAX_BARS.
+    closes = [1.10 + i * 0.001 for i in range(10)]
+    now = FakeClock().now
+    start = int(now.timestamp()) - 9 * 3600 - 1800
+    fake = FakeMT5([make_symbol("EURUSD")], rates={"EURUSD": make_rates(closes, start_time=start)})
+    client, _ = make_client(fake, max_bars=5)
+    df = client.rates("EURUSD", "H1", 5, include_current=False)
+    assert len(df) == 5 and df["close"].iloc[-1] == pytest.approx(closes[-2])
+
+
+def test_rates_flags_candle_from_the_future():
+    # Servidor em UTC+2 tratado como UTC: o candle "atual" abriria 2 h depois de agora.
+    closes = [1.10, 1.11, 1.12]
+    now = FakeClock().now
+    start = int(now.timestamp()) + 7200 - 2 * 3600
+    fake = FakeMT5([make_symbol("EURUSD")], rates={"EURUSD": make_rates(closes, start_time=start)})
+    client, _ = make_client(fake)
+    assert client.rates("EURUSD", "H1", 3).attrs["horario_inconsistente"] is True
+    assert client.rates("EURUSD", "H1", 2, include_current=False).attrs["horario_inconsistente"] is True
+    assert rates_client()[0].rates("EURUSD", "H1", 3).attrs["horario_inconsistente"] is False
+
+
+def test_rates_flags_one_hour_skew_even_without_current_candle():
+    # Servidor em UTC+1: o candle "atual" abre 1 h depois de agora e é descartado; o alerta não pode sumir junto.
+    now = FakeClock().now
+    start = int(now.timestamp()) + 3600 - 2 * 3600
+    fake = FakeMT5([make_symbol("EURUSD")], rates={"EURUSD": make_rates([1.1, 1.2, 1.3], start_time=start)})
+    client, _ = make_client(fake)
+    assert client.rates("EURUSD", "H1", 2, include_current=False).attrs["horario_inconsistente"] is True
+
+
+def test_rates_report_connection_state():
+    fake = FakeMT5([make_symbol("EURUSD")], rates={"EURUSD": make_rates([1.1, 1.2, 1.3])})
+    client, _ = make_client(fake)
+    assert client.rates("EURUSD", "H1", 3).attrs["conectado"] is True
+    fake.connected = False
+    assert client.rates("EURUSD", "H1", 3).attrs["conectado"] is False
+
+
+def test_rates_respect_terminal_maxbars():
+    # O terminal recusa pedir maxbars candles ou mais ("Invalid params"); o cliente pede maxbars - 1.
+    closes = [1.10 + i * 0.001 for i in range(20)]
+    fake = FakeMT5([make_symbol("EURUSD")], rates={"EURUSD": make_rates(closes)}, maxbars=10)
+    client, _ = make_client(fake)
+    assert len(client.rates("EURUSD", "M1", 100)) == 9
+    assert len(client.rates("EURUSD", "M1", 100, include_current=False)) == 9
 
 
 def test_rates_invalid_timeframe():
@@ -340,7 +419,9 @@ def test_positions_mapping():
     assert out[0] == {
         "ticket": 1, "simbolo": "EURUSD", "tipo": "compra", "volume": 0.1, "preco_abertura": 1.1,
         "preco_atual": 1.101, "stop_loss": 1.09, "take_profit": 1.12, "lucro": 10.0, "swap": -0.5,
-        "abertura": "2023-11-14 22:13:20",
+        # novembro de 2023: Nova York em horário padrão (UTC-5)
+        "abertura": {"utc": "2023-11-14T22:13:20Z", "sao_paulo": "2023-11-14 19:13:20",
+                     "nova_york": "2023-11-14 17:13:20"},
     }
 
 
@@ -473,35 +554,6 @@ def test_zero_tick_gives_error_after_three_attempts():
     assert client.clock.sleeps == [0.3, 0.3]
 
 
-def test_weekend_warning_forex_saturday():
-    client, _ = make_client()
-    client.clock.now = datetime(2026, 10, 3, 12, 0, tzinfo=timezone.utc)
-    assert "fim de semana" in client.quote("EURUSD")["aviso"]
-
-
-@pytest.mark.parametrize(
-    "when,expected",
-    [
-        (datetime(2026, 10, 4, 20, 59, tzinfo=timezone.utc), True),  # domingo antes das 21h
-        (datetime(2026, 10, 4, 21, 0, tzinfo=timezone.utc), False),
-        (datetime(2026, 10, 2, 21, 0, tzinfo=timezone.utc), True),  # sexta às 21h
-        (datetime(2026, 10, 2, 20, 59, tzinfo=timezone.utc), False),
-        (datetime(2026, 9, 30, 12, 0, tzinfo=timezone.utc), False),  # quarta
-    ],
-)
-def test_weekend_window(when, expected):
-    client, _ = make_client()
-    client.clock.now = when
-    assert ("aviso" in client.quote("EURUSD")) is expected
-
-
-def test_no_warning_for_crypto_on_weekend():
-    btc = make_symbol("BTCUSD", path="Crypto\\Majors", digits=2, point=0.01, bid=60000.0, ask=60010.0)
-    client, _ = make_client(FakeMT5([btc]))
-    client.clock.now = datetime(2026, 10, 3, 12, 0, tzinfo=timezone.utc)
-    assert "aviso" not in client.quote("BTCUSD")
-
-
 def test_rates_retry_then_success():
     closes = [1.1 + i * 0.001 for i in range(5)]
     fake = FakeMT5([make_symbol("EURUSD")], rates={"EURUSD": make_rates(closes)}, rates_fail_times=2)
@@ -550,3 +602,264 @@ def test_proxy_blocks_order_send_and_other_writes():
     with pytest.raises(MT5Error, match="order_send"):
         mod.order_send({})
     assert mod.TIMEFRAME_H1 == fm.TIMEFRAME_H1  # constantes liberadas
+
+
+# ---------------------------------------------------------------- identidade da conta
+def test_unpinned_account_switch_clears_symbol_cache():
+    # Sem MT5_LOGIN/MT5_SERVER: a troca de conta é aceita, mas o cache de símbolos não pode sobreviver
+    # (Standard usa EURUSDm; Pro usa EURUSD).
+    fake = FakeMT5([make_symbol("EURUSDm")], login=111)
+    client, _ = make_client(fake)
+    assert client.resolve_symbol("EURUSD") == "EURUSDm"
+    fake.login = 222
+    fake.symbols = {"EURUSD": make_symbol("EURUSD")}
+    fake.selected = {"EURUSD"}
+    assert client.resolve_symbol("EURUSD") == "EURUSD"
+    assert client.account()["login"] == 222
+
+
+def test_pinned_account_switch_after_connect_blocks_without_relogin():
+    fake = FakeMT5([make_symbol("EURUSD")], login=123)
+    client, _ = make_client(fake, mt5_login=123, mt5_path=DEDICATED)
+    client.quote("EURUSD")
+    fake.login = 999  # troca de conta feita no terminal
+    with pytest.raises(MT5Error, match="trocada no terminal") as exc:
+        client.quote("EURUSD")
+    assert "999" in str(exc.value) and "123" in str(exc.value)
+    assert fake.shutdown_calls == 0 and len(fake.initialize_calls) == 1  # não força login de volta
+    with pytest.raises(MT5Error):
+        client.account()
+    fake.login = 123  # voltou para a conta configurada
+    assert client.quote("EURUSD")["estado"] == "atual"
+
+
+def test_pinned_server_mismatch_at_connect():
+    fake = FakeMT5([make_symbol("EURUSD")], login=123, server="Outra-Corretora-Live")
+    client, _ = make_client(fake, mt5_login=123, mt5_server="Exness-MT5Trial", mt5_path=DEDICATED)
+    with pytest.raises(MT5Error, match="no servidor Outra-Corretora-Live, diferente de MT5_SERVER"):
+        client.ensure_connected()
+    assert fake.shutdown_calls == 1 and fake.initialized is False
+
+
+def test_pinned_server_only_detects_switch():
+    fake = FakeMT5([make_symbol("EURUSD")])
+    client, _ = make_client(fake, mt5_server="Exness-MT5Trial")
+    client.ensure_connected()
+    fake.server = "Exness-MT5Real8"
+    with pytest.raises(MT5Error, match="Exness-MT5Real8"):
+        client.quote("EURUSD")
+
+
+def test_login_only_pin_blocks_server_switch():
+    fake = FakeMT5([make_symbol("EURUSD")], login=123)
+    client, _ = make_client(fake, mt5_login=123, mt5_path=DEDICATED)
+    client.ensure_connected()
+    fake.server = "Exness-MT5Real8"
+    fake.trade_mode = fm.ACCOUNT_TRADE_MODE_REAL
+    with pytest.raises(MT5Error, match="Exness-MT5Real8.*diferente da conectada no início"):
+        client.quote("EURUSD")
+
+
+def test_server_only_pin_blocks_login_switch():
+    fake = FakeMT5([make_symbol("EURUSD")], login=111)
+    client, _ = make_client(fake, mt5_server="Exness-MT5Trial")
+    client.ensure_connected()
+    fake.login = 222
+    with pytest.raises(MT5Error, match="na conta 222 .*conta original"):
+        client.account()
+
+
+def test_login_only_pin_freeze_survives_terminal_restart():
+    # MT5_LOGIN sozinho não fixa o servidor no initialize(): depois de reiniciar, a conta original continua exigida.
+    fake = FakeMT5([make_symbol("EURUSD")], login=123)
+    client, _ = make_client(fake, mt5_login=123, mt5_path=DEDICATED)
+    client.ensure_connected()
+    fake.server = "Exness-MT5Real8"
+    fake.initialized = False  # terminal reiniciado
+    with pytest.raises(MT5Error, match="diferente da conectada no início"):
+        client.quote("EURUSD")
+    assert fake.shutdown_calls >= 1
+
+
+def test_server_only_pin_freeze_survives_terminal_restart():
+    fake = FakeMT5([make_symbol("EURUSD")], login=1)
+    client, _ = make_client(fake, mt5_server="Exness-MT5Trial")
+    client.ensure_connected()
+    fake.login = 2
+    fake.initialized = False
+    with pytest.raises(MT5Error, match="na conta 2 "):
+        client.account()
+    fake.login = 1  # voltou: reconecta normalmente
+    assert client.account()["login"] == 1
+
+
+def test_account_info_none_after_connect_raises(monkeypatch):
+    client, fake = make_client()
+    client.ensure_connected()
+    monkeypatch.setattr(fake, "account_info", lambda: None)
+    with pytest.raises(MT5Error, match="não informou a conta logada"):
+        client.quote("EURUSD")
+
+
+def test_account_pinned_property():
+    assert make_client()[0].account_pinned is False
+    assert make_client(mt5_server="Exness-MT5Trial")[0].account_pinned is True
+    assert make_client(FakeMT5(login=1), mt5_login=1, mt5_path=DEDICATED)[0].account_pinned is True
+
+
+# ---------------------------------------------------------------- conexão depois de conectado
+def test_disconnect_after_connect_marks_quote_and_account():
+    client, fake = make_client()
+    client.quote("EURUSD")
+    fake.connected = False  # terminal aberto, mas sem conexão com a corretora
+    q = client.quote("EURUSD")
+    assert q["estado"] == "desconectado" and "sem conexão" in q["aviso"]
+    assert client.account()["conectado"] is False
+    fake.connected = True
+    assert client.quote("EURUSD")["estado"] == "atual"
+    assert len(fake.initialize_calls) == 1
+
+
+# ---------------------------------------------------------------- estado da cotação
+NOW = datetime(2026, 9, 30, 12, 0, tzinfo=timezone.utc)
+
+
+def _stale_client(age_s: float, traded_last_week: bool):
+    """Cotação com `age_s` segundos; candle M1 no mesmo horário da semana passada se `traded_last_week`."""
+    week_ago = int((NOW - timedelta(days=7)).timestamp())
+    if traded_last_week:
+        rates = make_rates([1.1, 1.1], start_time=week_ago - 60, step_seconds=60)
+    else:
+        rates = make_rates([1.1], start_time=week_ago - 86_400)
+    fake = FakeMT5(
+        [make_symbol("USTECm", path="Indices\\USTECm")], rates={"USTECm": rates}, tick_age_s={"USTECm": age_s}
+    )
+    return make_client(fake)
+
+
+def test_quote_fresh_is_current():
+    client, _ = _stale_client(30, traded_last_week=True)
+    q = client.quote("USTEC")
+    assert q["estado"] == "atual" and q["idade_s"] == 30.0 and "aviso" not in q
+
+
+def test_quote_old_tick_when_market_usually_closed():
+    client, _ = _stale_client(4020, traded_last_week=False)  # 67 min, como o UKOIL no terminal real
+    q = client.quote("USTEC")
+    assert q["estado"] == "mercado_fechado_provavel"
+    assert "1 h 07 min" in q["aviso"] and "semana passada" in q["aviso"]
+
+
+def test_quote_old_tick_when_market_usually_open_is_delayed():
+    client, _ = _stale_client(600, traded_last_week=True)
+    q = client.quote("USTEC")
+    assert q["estado"] == "atrasado" and "Não trate como preço atual" in q["aviso"]
+
+
+def test_quote_old_tick_without_history_is_old(monkeypatch):
+    client, fake = _stale_client(600, traded_last_week=True)
+    monkeypatch.setattr(fake, "copy_rates_range", lambda *a, **k: None)
+    assert client.quote("USTEC")["estado"] == "antigo"
+
+
+def test_quote_history_lookup_error_does_not_break_quote(monkeypatch):
+    client, fake = _stale_client(600, traded_last_week=True)
+
+    def boom(*a, **k):
+        raise RuntimeError("falha interna")
+
+    monkeypatch.setattr(fake, "copy_rates_range", boom)
+    q = client.quote("USTEC")
+    assert q["estado"] == "antigo" and q["bid"] > 0
+
+
+def test_quote_last_week_lookup_uses_m1_and_the_missing_interval():
+    client, fake = _stale_client(600, traded_last_week=True)
+    client.quote("USTEC")
+    symbol, timeframe, start, end = fake.range_calls[-1]
+    assert symbol == "USTECm" and timeframe == fm.TIMEFRAME_M1
+    week = timedelta(days=7)
+    assert start == NOW - timedelta(seconds=600) + timedelta(seconds=60) - week and end == NOW - week
+
+
+def _session_client(now: datetime, tick_at: datetime, last_week_bars: list[datetime]):
+    week = timedelta(days=7)
+    times = [int((t - week).timestamp()) for t in last_week_bars]
+    rates = make_rates([1.1] * len(times))
+    rates["time"] = times
+    fake = FakeMT5(
+        [make_symbol("USTECm", path="Indices\\USTECm")],
+        rates={"USTECm": rates},
+        tick_age_s={"USTECm": (now - tick_at).total_seconds()},
+    )
+    client, _ = make_client(fake)
+    client.clock.now = now
+    return client
+
+
+def test_quote_just_after_session_close_is_closed_not_delayed():
+    # Sessão fecha às 21:00 UTC; às 21:02 o último tick é de 20:59. Na semana passada, idem.
+    close = datetime(2026, 9, 30, 21, 0, tzinfo=timezone.utc)
+    bars = [close - timedelta(minutes=m) for m in range(30, 0, -1)]  # 20:30..20:59
+    client = _session_client(close + timedelta(minutes=2), close - timedelta(minutes=1), bars)
+    assert client.quote("USTEC")["estado"] == "mercado_fechado_provavel"
+
+
+def test_quote_just_before_session_reopen_is_closed_not_delayed():
+    # Às 21:58, perto da reabertura das 22:00: o intervalo sem ticks (21:00-21:58) também ficou vazio na semana passada.
+    reopen = datetime(2026, 9, 30, 22, 0, tzinfo=timezone.utc)
+    bars = [reopen - timedelta(minutes=61), reopen, reopen + timedelta(minutes=1)]
+    client = _session_client(reopen - timedelta(minutes=2), reopen - timedelta(minutes=61), bars)
+    assert client.quote("USTEC")["estado"] == "mercado_fechado_provavel"
+
+
+@pytest.mark.parametrize("age", [65, 75, 90, 110, 125])
+def test_quote_short_stall_in_open_session_is_delayed(age):
+    # Sessão ativa na semana passada; o feed parou há pouco mais de 1 min: deve ser "atrasado", não "fechado".
+    now = datetime(2026, 9, 30, 12, 1, 45, tzinfo=timezone.utc)
+    bars = [datetime(2026, 9, 30, 11, 30, tzinfo=timezone.utc) + timedelta(minutes=m) for m in range(60)]
+    client = _session_client(now, now - timedelta(seconds=age), bars)
+    assert client.quote("USTEC")["estado"] == "atrasado"
+
+
+def test_quote_older_than_a_week_is_old():
+    client, _ = _stale_client(8 * 86400, traded_last_week=True)
+    q = client.quote("USTEC")
+    assert q["estado"] == "antigo" and "mais de uma semana" in q["aviso"]
+
+
+def test_quote_from_the_future_flags_time_base():
+    client, _ = _stale_client(-7200, traded_last_week=True)  # um servidor em UTC+2 apareceria assim
+    q = client.quote("USTEC")
+    assert q["estado"] == "horario_inconsistente" and "2 h 00 min" in q["aviso"]
+    assert q["idade_s"] == -7200.0
+
+
+def test_quote_slightly_ahead_clock_shows_zero_age():
+    client, _ = _stale_client(-1.0, traded_last_week=True)  # relógio do PC ~1 s atrás do servidor
+    q = client.quote("USTEC")
+    assert q["estado"] == "atual" and q["idade_s"] == 0.0
+
+
+def test_crypto_on_saturday_with_fresh_tick_is_current():
+    btc = make_symbol("BTCUSD", path="Crypto\\Majors", digits=2, point=0.01, bid=60000.0, ask=60010.0)
+    client, _ = make_client(FakeMT5([btc]))
+    client.clock.now = datetime(2026, 10, 3, 12, 0, tzinfo=timezone.utc)
+    assert client.quote("BTCUSD")["estado"] == "atual"
+
+
+def test_quote_uses_millisecond_time():
+    client, _ = _stale_client(0.25, traded_last_week=True)
+    assert client.quote("USTEC")["idade_s"] == pytest.approx(0.2, abs=0.06)
+
+
+# ---------------------------------------------------------------- terminal
+def test_terminal_reports_trading_locks():
+    client, _ = make_client(FakeMT5([make_symbol("EURUSD")], tradeapi_disabled=True))
+    assert client.terminal() == {
+        "conectado": True,
+        "algo_trading_ativo": False,
+        "negociacao_via_python_desativada": True,
+        "build": 5000,
+        "max_barras_grafico": 100_000,
+    }
