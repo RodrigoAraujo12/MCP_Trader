@@ -55,7 +55,21 @@ A Exness informa os spreads do reinício da sessão: USTECm 112 pontos (1,12 pon
 - `cotacao("UKOIL")` devolveu um tick de 67 min atrás como cotação normal, sem aviso. Agora o resultado traz `estado = "mercado_fechado_provavel"`.
 - Os horários eram rotulados "horário do servidor" sem dizer que são UTC. Agora são UTC, com São Paulo e Nova York ao lado.
 
+## Calendário econômico (serviço `TradingMcpCalendar`, iniciado às 23:28 UTC)
+
+O primeiro arquivo exportado tinha 150 eventos e 227 valores dos EUA, cobrindo de 7 dias atrás a 14 dias à frente. O JSON saiu em UTF-8 sem BOM, e a diferença do servidor para o GMT era 0.
+
+- **Escala confirmada:** valor ÷ 10⁶ dá o número exibido, na unidade do multiplicador.
+  - NFP de 2/10: previsão 52 e anterior 162, com `THOUSANDS` (mil empregos).
+  - Continuing Claims: 1,701, com `MILLIONS`.
+- **Anterior revisado:** no Initial Jobless Claims de 1/10 vieram anterior 197 e anterior revisado 198. O original e a revisão chegam separados.
+- **Nomes traduzidos pelo terminal, com erro:** `consumer-price-index-mm` (CPI cheio) aparecia como "Núcleo do Índice de Preços ao Consumidor (IPC) (Mensal)", o mesmo nome de `consumer-price-index-ex-food-energy-mm` (núcleo). Use sempre o `event_code`.
+- **A previsão do MT5 não é necessariamente consenso:** o NFP de 2/10 tinha previsão de 52 mil no MT5 e consenso de 89 mil no Forex Factory. Algumas previsões têm 3 casas decimais (por exemplo, balança comercial −81,515), típicas de modelo.
+- **Revisões:** `revision` 0 indica divulgação única; 1, primeira estimativa; 2 ou mais, estimativa revisada. Exemplo: os estoques no atacado de agosto saíram em 30/09 com revisão 1 e realizado 0,7, e o valor de 08/10, com revisão 3 e o mesmo período, traz `prev` = 0,7. Por isso, numa estimativa revisada, `anterior` é a estimativa anterior do mesmo período.
+- **Feriados:** Columbus Day vem com importância `NONE` e horário 00:00 (modo `DATE`).
+- **Realizado ausente:** o PMI industrial da S&P Global (`markit-manufacturing-pmi`, 13:45 UTC) continuava sem realizado cerca de 10 h depois. O ISM das 14:00 UTC tinha realizado.
+
 ## Ainda não reproduzido no terminal real
 
 - Troca de conta e perda de conexão com o servidor em execução. Estão cobertas por testes com MT5 simulado.
-- Acesso do Service MQL5 ao calendário. A aba Calendário do terminal mostra eventos.
+- Latência do calendário numa divulgação real. A primeira oportunidade é o NFP de 2/10, às 12:30 UTC, com o serviço rodando antes.

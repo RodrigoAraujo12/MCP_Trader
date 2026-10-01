@@ -157,6 +157,7 @@ class FakeMT5:
         self.server = server
         self.maxbars = maxbars
         self.tradeapi_disabled = tradeapi_disabled
+        self.data_path = "C:/fake/MetaQuotes/Terminal/ABC"
         # Relógio dos ticks (epoch UTC); os testes o alinham ao relógio do cliente.
         self.now: Callable[[], float] = now or _time.time
         # Idade (s) do último tick por símbolo; ausente = tick de agora.
@@ -200,6 +201,7 @@ class FakeMT5:
             trade_allowed=False,
             tradeapi_disabled=self.tradeapi_disabled,
             maxbars=self.maxbars,
+            data_path=self.data_path,
             name="MetaTrader 5 (fake)",
             build=5000,
         )

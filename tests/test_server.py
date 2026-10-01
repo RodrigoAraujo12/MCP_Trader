@@ -15,7 +15,9 @@ from trading_mcp.mt5_client import MT5Client
 from trading_mcp.sec_edgar import SecEdgarError
 from trading_mcp.server import create_server
 
-EXPECTED_TOOLS = {"cotacao", "historico", "indicadores", "tamanho_posicao", "info_conta", "simbolos", "fundamentos"}
+EXPECTED_TOOLS = {
+    "cotacao", "historico", "indicadores", "tamanho_posicao", "info_conta", "simbolos", "calendario", "fundamentos"
+}
 
 
 @pytest.fixture
@@ -81,9 +83,10 @@ class FakeSec:
         return {"ticker": ticker.upper(), "empresa": "Apple Inc.", "cik": 320193}
 
 
-def _server(fake: FakeMT5 | None = None, sec: Any | None = None, **settings_kwargs: Any):
+def _server(fake: FakeMT5 | None = None, sec: Any | None = None, calendar: Any | None = None, **settings_kwargs: Any):
     settings = Settings(max_bars=5_000, **settings_kwargs)
-    return create_server(settings, MT5Client(settings, mt5_module=fake or _fake_mt5()), sec or FakeSec())
+    mt5 = MT5Client(settings, mt5_module=fake or _fake_mt5())
+    return create_server(settings, mt5, sec or FakeSec(), calendar)
 
 
 def _payload(result: Any) -> Any:
@@ -427,3 +430,35 @@ async def test_stdio_server_starts_from_other_cwd(tmp_path: Any) -> None:
         result = await client.call_tool("indicadores", {"simbolo": "EURUSD", "lista": ["MACD(26,12,9)"]})
     assert {t.name for t in tools} == EXPECTED_TOOLS
     assert result.is_error and "MACD" in _error_text(result)
+
+
+@pytest.mark.anyio
+async def test_calendario_without_service_file_is_tool_error() -> None:
+    async with Client(_server()) as client:
+        result = await client.call_tool("calendario", {})
+    text = _error_text(result)
+    assert "TradingMcpCalendar" in text and "calendar_US.json" in text
+
+
+@pytest.mark.anyio
+async def test_calendario_returns_events(tmp_path: Any) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from test_calendario import ev, val, write
+    from trading_mcp.calendario import EconomicCalendar
+
+    now = datetime.now(timezone.utc)
+    path = write(
+        tmp_path,
+        [ev(1, "Nonfarm Payrolls", "nonfarm-payrolls", unit="JOB", mult="THOUSANDS", digits=0)],
+        [val(10, 1, now + timedelta(minutes=20), forecast=89, prev=162)],
+        generated_gmt=int(now.timestamp()),
+    )
+    async with Client(_server(calendar=EconomicCalendar(lambda: path))) as client:
+        data = _payload(await client.call_tool("calendario", {"horas_a_frente": 0.5, "horas_atras": 0}))
+        bad = await client.call_tool("calendario", {"importancia_minima": "altissima"})
+    event = data["eventos"][0]
+    assert event["evento"] == "Nonfarm Payrolls" and event["situacao"] == "agendado"
+    assert event["previsao"] == 89.0 and event["realizado"] is None
+    assert data["estado"] == "atual"
+    assert bad.is_error

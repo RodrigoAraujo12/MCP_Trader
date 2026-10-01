@@ -676,6 +676,17 @@ class MT5Client:
             }
 
     @_guard
+    def terminal_data_path(self) -> str:
+        """Pasta de dados do terminal (onde ficam MQL5\\Files e os serviços)."""
+        with self._lock:
+            self.ensure_connected()
+            t = self._call("terminal_info")
+            path = getattr(t, "data_path", None) if t is not None else None
+            if not path:
+                raise MT5Error(f"O terminal não informou a pasta de dados: {self._last_error()}")
+            return str(path)
+
+    @_guard
     def positions(self) -> list[dict]:
         """Posições abertas."""
         with self._lock:

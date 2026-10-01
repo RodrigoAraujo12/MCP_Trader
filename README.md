@@ -79,6 +79,7 @@ Use uma instalação **separada** do MT5, logada **só** na conta demo, e aponte
 | `tamanho_posicao` | Lote para arriscar X% do saldo | `simbolo`, `entrada`, `stop`, `risco_percentual` (padrão 1%), `saldo` (padrão: saldo da conta) |
 | `info_conta` | Saldo, margem, posições abertas e travas de negociação do terminal | — |
 | `simbolos` | Busca símbolos disponíveis na conta | `busca` (ex.: USD, Apple), `limite` (1–200, padrão 30) |
+| `calendario` | Calendário econômico dos EUA: horário (UTC/SP/NY), importância, realizado, previsão, anterior, anterior revisado e surpresa | `horas_a_frente` (padrão 24), `horas_atras` (padrão 2), `importancia_minima`, `busca` (ex.: CPI, NFP, claims, FOMC) |
 | `fundamentos` | Fundamentos da SEC EDGAR (receita, lucro, LPA, ROE, margem) | `ticker` (ex.: AAPL, MSFT, BRK.B) |
 
 **Estado da cotação**: `atual` (tick com até 60 s), `mercado_fechado_provavel` (sem ticks recentes e sem negociação, na semana anterior, no mesmo intervalo que hoje está sem ticks: pausa diária, fim de semana, fora da sessão), `atrasado` (sem ticks recentes, mas na semana anterior houve negociação nesse intervalo: feriado, atraso ou problema de conexão), `antigo` (não foi possível verificar, ou o último tick tem mais de uma semana), `desconectado` (terminal sem conexão com a corretora) e `horario_inconsistente` (tick à frente do relógio UTC: servidor fora de UTC ou relógio do Windows errado). Só `atual` deve ser tratado como preço de agora.
@@ -92,6 +93,8 @@ Use uma instalação **separada** do MT5, logada **só** na conta demo, e aponte
 ## Exemplos de perguntas
 
 - "Como está o USTEC agora? A cotação é atual?"
+- "Tem evento importante dos EUA nos próximos 30 minutos?"
+- "O Jobless Claims saiu? Compare realizado, previsão e anterior."
 - "Qual é o RSI e o MACD do EURUSD no H4?"
 - "Quantos lotes devo usar para arriscar 1% com entrada 1.0850 e stop 1.0820 no EURUSD?"
 - "Mostre os fundamentos da AAPL: receita, lucro, margem e ROE do último ano."
@@ -99,13 +102,36 @@ Use uma instalação **separada** do MT5, logada **só** na conta demo, e aponte
 - "Quais são as posições abertas na minha conta?"
 - "Qual é o nome do símbolo da Apple e da Tesla nesta conta?"
 
+## Calendário econômico (serviço MQL5)
+
+A biblioteca Python do MetaTrader 5 não acessa o calendário econômico. Por isso, um pequeno serviço MQL5 (`mql5/Services/TradingMcpCalendar.mq5`) roda dentro do terminal e grava o calendário dos EUA em `MQL5\Files\trading_mcp\calendar_US.json`. A ferramenta `calendario` só lê esse arquivo. O serviço não negocia, então funciona com o Algo Trading desligado e com a negociação via Python desativada.
+
+Instalação (uma vez):
+
+1. Copie `mql5/Services/TradingMcpCalendar.mq5` para a pasta `MQL5\Services` do terminal (no MT5: **Arquivo → Abrir pasta de dados**).
+2. Compile: abra no MetaEditor (F4 no terminal) e pressione F7, ou pela linha de comando: `MetaEditor64.exe /compile:"<pasta de dados>\MQL5\Services\TradingMcpCalendar.mq5" /log`.
+3. No terminal, **Navegador (Ctrl+N) → Serviços → TradingMcpCalendar → botão direito → Adicionar serviço → OK**. A aba Diário mostra `TradingMcpCalendar: exportando US...`.
+
+O serviço confere mudanças a cada 15 s e regrava tudo a cada 5 min. Ele volta sozinho quando o terminal reabre, se estava rodando ao fechar. Se o arquivo parar de ser atualizado, a ferramenta avisa (`estado = "desatualizado"`).
+
+Como ler os dados:
+
+- **Identifique a medida pelo `codigo`** (em inglês), por `descricao` e por `medida`, nunca só pelo nome. O terminal traduz os nomes e às vezes erra: em 2026-10-01 o CPI cheio mensal aparecia como "Núcleo do Índice de Preços ao Consumidor (IPC) (Mensal)", o mesmo nome do núcleo.
+- **Valores**: na unidade do indicador (`unidade`; por exemplo, NFP em "mil empregos": 162 = 162 mil). `surpresa` = realizado − previsão na mesma unidade (p.p. para percentuais).
+- **Previsão, não consenso**: o campo é `previsao`, a previsão do calendário do MT5, que nem sempre é o consenso de mercado (pesquisa com analistas). Há previsões com 3 casas decimais, típicas de modelo. Ausente vem como `null`, nunca zero. Em 2026-10-01, o NFP de 2/10 tinha previsão de 52 mil no MT5 e consenso de 89 mil no Forex Factory.
+- **Estimativas revisadas**: `estimativa` aparece quando o dado tem várias divulgações para o mesmo período (PIB, Michigan, estoques). Numa estimativa revisada, `anterior` é a estimativa anterior do **mesmo** período, não o período anterior.
+- **Feriados** sempre aparecem, com `data` em vez de horário, porque afetam as sessões.
+- **Anterior e anterior revisado**: `anterior` é o valor publicado na divulgação anterior; `anterior_revisado` só aparece quando a fonte o revisou.
+- **Latência**: `latencia_fonte_s` é o tempo entre o horário do evento e a primeira vez que o serviço viu o realizado. Só aparece se o serviço já estava rodando antes da divulgação.
+- **Simultâneos**: `mesmo_horario` lista todos os eventos de cada horário, inclusive os fora do filtro. Use para não atribuir a um único dado um movimento de preço.
+
 ## Conectar ao Claude
 
 Nos exemplos abaixo, troque `C:\caminho\para\MCP_Trader` pela pasta onde você clonou o projeto.
 
 ### Claude Desktop
 
-Edite `%APPDATA%\Claude\claude_desktop_config.json` e adicione:
+Edite `claude_desktop_config.json` (no app: **Configurações → Desenvolvedor → Editar configuração**) e adicione o servidor. Na instalação da Microsoft Store o arquivo fica em `%LOCALAPPDATA%\Packages\Claude_<id>\LocalCache\Roaming\Claude\`, não em `%APPDATA%\Claude\`. **Edite com o Claude Desktop totalmente fechado** (ícone da bandeja → Sair): com ele aberto, o app regrava o arquivo e descarta a edição.
 
 ```json
 {
@@ -149,6 +175,7 @@ src/trading_mcp/
 ├── config.py          # Leitura do .env e das variáveis de ambiente
 ├── mt5_client.py      # Cliente MetaTrader 5 (somente leitura, identidade da conta, estado das cotações)
 ├── tempo.py           # Base de tempo: UTC, exibição em São Paulo e Nova York, fim de candle
+├── calendario.py      # Calendário econômico (lê o arquivo do serviço MQL5)
 ├── indicators.py      # Indicadores técnicos
 ├── risk.py            # Tamanho de posição e arredondamento de lote
 └── sec_edgar.py       # Fundamentos da SEC EDGAR
@@ -158,7 +185,10 @@ tests/
 └── test_*.py          # Testes
 
 docs/
-└── diagnostico-mt5-2026-10-01.md   # Medições no terminal real (fuso, sessões, histórico, símbolos)
+└── diagnostico-mt5-2026-10-01.md   # Medições no terminal real (fuso, sessões, histórico, símbolos, calendário)
+
+mql5/Services/
+└── TradingMcpCalendar.mq5          # Serviço que exporta o calendário econômico do MT5
 ```
 
 ## Notas
@@ -174,12 +204,17 @@ docs/
 - Validado em 2026-10-01 com uma conta demo Standard da Exness (`docs/diagnostico-mt5-2026-10-01.md`). Troca de conta e perda de conexão com o servidor rodando ainda não foram reproduzidas no terminal real, só com o MT5 simulado.
 - O estado da cotação deduz a sessão pela semana anterior: num feriado, uma cotação parada aparece como `atrasado`; se o feriado foi na semana anterior, uma parada real hoje aparece como `mercado_fechado_provavel`. Na semana da mudança do horário de verão, a pausa diária pode ser classificada errada por 1 hora.
 - O fuso UTC do servidor precisa ser reconferido depois de 1/11/2026 (fim do horário de verão dos EUA).
+- Calendário: depende do terminal aberto com o serviço rodando. Alguns indicadores ficam sem realizado no calendário do MT5 (em 2026-10-01, o PMI industrial da S&P Global continuava sem valor horas depois da divulgação). A latência da fonte ainda não foi medida numa divulgação real.
 - Para alguns bancos e empresas com duas classes de ações, `caixa` e `acoes_em_circulacao` vêm vazios, com uma observação explicando.
 
 ## Roadmap
 
-- **Fase 1** (atual): dados de mercado, indicadores, tamanho de posição e fundamentos, somente leitura.
-- **Fase 2**: backtest de estratégias. Candidata a ganhar o primeiro componente visual: um gráfico da curva de resultado exibido dentro do chat do Claude (MCP Apps).
-- **Fase 3**: carteira (lucro/prejuízo, preço médio).
-- **Fase 4**: execução de ordens **somente em conta demo**, com trava no código (recusa se a conta não for demo) e limites de lote.
-- **Opcional**: dashboard web próprio (por exemplo, com Streamlit) reaproveitando os mesmos módulos, para usar sem o Claude.
+Revisado em 2026-10-01. Tudo continua somente leitura até a etapa F.
+
+- **A** (feito): base validada no MT5 real (identidade da conta, horários em UTC, estado da cotação).
+- **B**: calendário econômico (feito: B2), consulta de posições com distâncias e risco até o stop (B1) e journal manual em SQLite (B3).
+- **C**: reação observada a eventos (janelas de 1/5/15 min alinhadas em UTC) e contexto entre ativos; notícias só depois de medir a latência das fontes gratuitas.
+- **D**: backtest de um único setup definido por regras objetivas.
+- **E**: propostas de operação com limites rígidos e aprovação humana fora do chat, ainda sem envio.
+- **F**: execução **somente em conta demo**, com verificação de conta imediatamente antes do envio, reconciliação e kill switch.
+- **G**: coleta contínua, alertas ou dashboard, só se o uso justificar.

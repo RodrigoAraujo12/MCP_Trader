@@ -9,7 +9,8 @@ import contextlib
 import logging
 import sys
 from collections.abc import Iterator
-from typing import Annotated, Any
+from pathlib import Path
+from typing import Annotated, Any, Literal
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
@@ -17,6 +18,7 @@ from mcp_types import ToolAnnotations
 from pydantic import Field
 
 from trading_mcp import indicators, risk, tempo
+from trading_mcp.calendario import CalendarError, EconomicCalendar
 from trading_mcp.config import Settings, load_settings
 from trading_mcp.mt5_client import MT5Client, MT5Error
 from trading_mcp.sec_edgar import SecEdgarClient, SecEdgarError
@@ -28,6 +30,8 @@ MAX_CANDLES_OUTPUT = 500
 DEFAULT_INDICATORS = ["RSI(14)", "MACD(12,26,9)", "EMA(20)", "EMA(50)", "ATR(14)"]
 # Entrada mais longe que isso do preço atual provavelmente é erro de digitação.
 ENTRY_DISTANCE_WARNING_PCT = 5.0
+# País exportado pelo serviço MQL5 TradingMcpCalendar.
+CALENDAR_COUNTRY = "US"
 
 INSTRUCTIONS = """\
 Servidor de dados de mercado (forex e CFDs de ações dos EUA via MetaTrader 5 / Exness; fundamentos via SEC EDGAR).
@@ -48,6 +52,12 @@ Regras de uso:
   (ATR = média simples do true range; linha de sinal do MACD = média simples), então podem diferir do gráfico do MT5.
 - `tamanho_posicao` não inclui comissão nem swap; contas Raw Spread/Zero cobram comissão por lote.
 - Símbolos podem ser informados sem sufixo (EURUSD); o servidor resolve para o nome da conta (ex.: EURUSDm).
+- Calendário: identifique a medida pelo `codigo`/`descricao`/`medida` (os nomes traduzidos podem estar
+  errados). Compare realizado e `previsao` na mesma unidade (a `surpresa` já vem calculada). A previsão é
+  do calendário do MT5 e pode não ser o consenso de mercado: não a chame de consenso. Ausente é null,
+  não zero. Com `estimativa` revisada, o `anterior` é a estimativa anterior do mesmo período. Separe o
+  fato publicado da sua interpretação e não transforme surpresa em compra ou venda. Para medir reação
+  de preço, use horários UTC alinhados e cite os eventos de `mesmo_horario`.
 - Os dados servem para estudo e análise; não são recomendação de investimento.
 """
 
@@ -61,7 +71,7 @@ def _tool_errors() -> Iterator[None]:
         yield
     except ToolError:
         raise
-    except (MT5Error, SecEdgarError, ValueError) as exc:
+    except (MT5Error, SecEdgarError, CalendarError, ValueError) as exc:
         raise ToolError(str(exc)) from exc
     except Exception as exc:
         # Sem isto o modelo veria só "Error executing tool X", sem pista do que houve.
@@ -93,10 +103,14 @@ def create_server(
     settings: Settings | None = None,
     mt5_client: MT5Client | None = None,
     sec_client: SecEdgarClient | None = None,
+    calendar: EconomicCalendar | None = None,
 ) -> MCPServer:
     settings = settings or load_settings()
     mt5 = mt5_client or MT5Client(settings)
     sec = sec_client or SecEdgarClient(settings.sec_user_agent)
+    calendar = calendar or EconomicCalendar(
+        lambda: Path(mt5.terminal_data_path()) / "MQL5" / "Files" / "trading_mcp" / f"calendar_{CALENDAR_COUNTRY}.json"
+    )
 
     server = MCPServer(name="trading-mcp", instructions=INSTRUCTIONS, version="0.1.0")
 
@@ -359,6 +373,36 @@ def create_server(
         """Procura símbolos disponíveis na conta (forex, metais, índices, ações)."""
         with _tool_errors():
             return mt5.search_symbols(busca, limite)
+
+    @server.tool(annotations=READ_ONLY)
+    def calendario(
+        horas_a_frente: Annotated[
+            float, Field(ge=0, le=336, description="Horas à frente de agora (0.5 = próximos 30 minutos)")
+        ] = 24,
+        horas_atras: Annotated[
+            float, Field(ge=0, le=168, description="Horas para trás, para eventos já divulgados")
+        ] = 2,
+        importancia_minima: Annotated[
+            Literal["baixa", "moderada", "alta"], Field(description="Importância mínima atribuída pela fonte")
+        ] = "moderada",
+        busca: Annotated[
+            str, Field(description="Texto no nome do evento, ex.: CPI, Nonfarm, FOMC, Jobless Claims, PPI, ISM")
+        ] = "",
+        limite: Annotated[int, Field(ge=1, le=100, description="Máximo de eventos")] = 40,
+    ) -> dict[str, Any]:
+        """Calendário econômico dos EUA (fonte: MetaTrader 5): horário (UTC/São Paulo/Nova York), importância,
+        realizado, previsão da fonte, anterior, anterior revisado e surpresa na unidade do indicador.
+
+        "Tem evento nos próximos 30 minutos?": horas_a_frente=0.5. "O indicador saiu?": horas_atras e busca.
+        """
+        with _tool_errors():
+            return calendar.query(
+                hours_back=horas_atras,
+                hours_ahead=horas_a_frente,
+                min_importance=importancia_minima,
+                search=busca,
+                limit=limite,
+            )
 
     @server.tool(annotations=READ_ONLY)
     def fundamentos(
