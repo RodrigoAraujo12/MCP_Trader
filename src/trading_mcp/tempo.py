@@ -19,6 +19,7 @@ NOVA_YORK = ZoneInfo("America/New_York")
 
 _TF_SECONDS = {
     "M1": 60,
+    "M3": 180,
     "M5": 300,
     "M15": 900,
     "M30": 1800,

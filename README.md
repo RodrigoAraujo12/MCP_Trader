@@ -78,7 +78,7 @@ Use uma instalação **separada** do MT5, logada **só** na conta demo, e aponte
 | Nome | Descrição | Parâmetros principais |
 |------|-----------|----------------------|
 | `cotacao` | Última cotação: bid, ask, spread, horário (UTC/São Paulo/Nova York), idade e estado | `simbolo` (ex.: USTEC, EURUSD) |
-| `historico` | Candles OHLC em CSV, com resumo do período | `simbolo`, `timeframe` (M1–MN1, padrão H1), `quantidade` (1–500, padrão 100), `incluir_candle_atual` (padrão: sim) |
+| `historico` | Candles OHLC em CSV, com resumo do período | `simbolo`, `timeframe` (M1, M3, M5… MN1; padrão H1), `quantidade` (1–500, padrão 100), `incluir_candle_atual` (padrão: sim) |
 | `indicadores` | RSI, MACD, EMA, SMA, ATR, Bollinger | `simbolo`, `lista` (padrão: RSI(14), MACD(12,26,9), EMA 20/50, ATR(14)), `timeframe`, `incluir_candle_atual` |
 | `tamanho_posicao` | Lote para arriscar X% do saldo | `simbolo`, `entrada`, `stop`, `risco_percentual` (padrão 1%), `saldo` (padrão: saldo da conta) |
 | `info_conta` | Saldo, margem, posições abertas e travas de negociação do terminal | — |
@@ -90,6 +90,7 @@ Use uma instalação **separada** do MT5, logada **só** na conta demo, e aponte
 | `contexto_mercado` | Instrumentos lado a lado: variação em 15 min, 1 h, 4 h e no dia, faixa do dia e estado da cotação | `simbolos` (padrão: `INSTRUMENTOS`) |
 | `reacoes_registrar` | Guarda as divulgações dos EUA que o calendário cobre e a reação medida de cada instrumento (não duplica; se faltar tempo, rode de novo) | — |
 | `reacoes_estatisticas` | Reações guardadas a um evento, agrupadas pela surpresa (acima, abaixo ou igual à previsão), com o tamanho da amostra | `evento` (vazio = o que está guardado), `simbolos`, `janelas_min` (1, 5, 15, 60; padrão 5 e 15), `dias` |
+| `estrutura_smc` | Estrutura SMC (só medição): topos e fundos micro e macro, BOS/CHoCH por pavio e por fechamento, premium/discount, FVGs, order blocks, liquidez igual e varreduras; máxima/mínima do dia e da semana de mercado e das sessões, topos/fundos diários | `simbolo`, `timeframes` (M1, M3, M5, M15, M30, H1, H4, D1; padrão M5, M15, H1, H4) |
 | `journal_sincronizar` | Importa as operações da conta do histórico do MT5 para o journal (não duplica, não apaga anotações) | `dias` (padrão 7) |
 | `journal_anotar` | Anota uma operação: setup, tags, motivo, observação, stop inicial, notícia | `operacao_id` ou `ticket`, e os campos a gravar |
 | `journal_listar` | Operações com resultado, R, stop inicial, notícia e anotações | `dias` (padrão 30), `simbolo`, `setup`, `status`, `limite` |
@@ -137,6 +138,19 @@ O calendário do terminal cobre poucos dias para trás e o M1, cerca de 3 meses:
 - **Onde fica**: `trading-mcp\reacoes.sqlite3` na pasta do seu usuário, ao lado do journal (`REACOES_PATH` muda o local). Cada registro que muda algo grava uma cópia em `journal_export\reacoes-copia.sqlite3`, dentro do projeto (vai para o OneDrive): medições com mais de ~3 meses não podem ser refeitas.
 - **Estimativas**: em eventos com primeira estimativa e revisões do mesmo período (PIB), `estimativas` conta cada tipo; as estatísticas juntam os dois.
 
+## Estrutura SMC
+
+`estrutura_smc` marca a estrutura do jeito que dá para medir sem opinião; a leitura e a decisão de entrar continuam suas. As regras seguem as implementações mais usadas (indicador "Smart Money Concepts" da LuxAlgo no TradingView e a biblioteca Python `smartmoneyconcepts`), com o que você usa por cima: rompimento por pavio **e** por fechamento, dia virando às 17:00 de Nova York, sessões e topos/fundos diários.
+
+- **Topos e fundos**: pelo pavio, confirmados alguns candles depois (sem repintar): **micro** = 5 candles de cada lado, **macro** = 50 (estrutura interna e externa da LuxAlgo). Só candles fechados entram.
+- **BOS/CHoCH**: rompimento do último topo/fundo ainda não rompido. A favor da tendência = BOS; contra = CHoCH (a tendência vira). Cada rompimento mostra quando o pavio passou (`por_pavio`) e quando um candle fechou além (`por_fechamento`); as duas leituras têm a própria tendência.
+- **Premium/discount**: onde o preço está na faixa entre o último topo e o último fundo macro, esticada pelos extremos depois deles para acompanhar um rompimento (acima de 52,5% = premium, abaixo de 47,5% = discount).
+- **FVG**: três candles com espaço entre a máxima do 1º e a mínima do 3º (ou o contrário), o do meio forte; mostra os abertos mais perto do preço e quanto já foi preenchido.
+- **Order block**: no rompimento por fechamento, o candle de mínima mais baixa (ou máxima mais alta) entre o topo/fundo rompido e o rompimento (regra da LuxAlgo); zona de pavio a pavio; sai da lista quando um candle fecha além da zona; `tocado` = o pavio já voltou nela. O mesmo candle no micro e no macro aparece uma vez.
+- **Liquidez**: topos/fundos iguais (a menos de 0,1 ATR; três ou mais seguidos viram um grupo) ainda não tomados; varreduras recentes (pavio além e fechamento de volta) dos topos/fundos micro e da liquidez igual, com `rompido_depois_em` quando o preço depois fechou além.
+- **Níveis** (`niveis`): máxima e mínima do dia e da semana de mercado atuais (até agora; no fim de semana, a semana atual é a que fechou na sexta) e anteriores (o dia vira às 17:00 de Nova York, pulando fim de semana e feriado; a semana, domingo 17:00); sessões de hoje e do dia anterior em sequência, cada uma até a abertura da seguinte (Ásia: Tóquio 9 h até Londres 8 h; Londres até Nova York 8 h; Nova York até 17 h, no horário local de cada praça); e os topos/fundos diários que nenhum candle passou, nem o de hoje (candle D1 do MT5, que vira às 00:00 UTC; o toco de domingo entra na segunda). Para cada máxima/mínima de um período encerrado, se e quando foi **varrida** (pavio além e fechou de volta) e/ou **rompida** (fechou além), em candles M5 fechados; `incompleto` = o histórico M5 do terminal não chega ao início do período.
+- **Primeira consulta de um símbolo** pode levar ~15 s (o terminal monta o histórico de timeframes como o M3); depois, menos de 1 s.
+
 ## Journal
 
 O journal registra as operações da conta demo para medir o que funciona. **O MT5 é a fonte dos fatos**: cada posição vira uma operação, com entrada e saída pelo preço médio dos negócios executados, volume, comissão, swap, resultado líquido, horários e motivo do fechamento (stop, alvo, manual). Você só acrescenta, pelo chat, o que o MT5 não sabe: setup, tags, motivo da entrada e observações.
@@ -157,6 +171,7 @@ O journal registra as operações da conta demo para medir o que funciona. **O M
 - "Como estão minhas estatísticas por setup? E com notícia e sem notícia?"
 - "O Claims veio acima da previsão. Como reagiram USTEC, US30, ouro, DXY e as moedas nos primeiros 15 minutos?"
 - "Me dá o contexto entre ativos agora: dólar, ouro, índices, petróleo e BTC."
+- "Como está a estrutura do ouro no M15, H1 e H4? Londres já varreu a máxima da Ásia?"
 - "Guarda as reações da semana. Como USTEC e ouro costumam reagir ao Claims acima e abaixo da previsão? Qual o tamanho da amostra?"
 - "Quantos lotes devo usar para arriscar 1% com entrada 1.0850 e stop 1.0820 no EURUSD?"
 - "Mostre os fundamentos da AAPL: receita, lucro, margem e ROE do último ano."
@@ -242,6 +257,7 @@ src/trading_mcp/
 ├── journal.py         # Journal de operações em SQLite (importado do histórico do MT5)
 ├── reacao.py          # Reação a eventos e contexto entre ativos
 ├── reacoes.py         # Reações guardadas (SQLite) e estatísticas por tipo de surpresa
+├── smc.py             # Estrutura SMC: topos/fundos, BOS/CHoCH, FVG, order blocks, liquidez, sessões
 ├── indicators.py      # Indicadores técnicos
 ├── risk.py            # Tamanho de posição e arredondamento de lote
 └── sec_edgar.py       # Fundamentos da SEC EDGAR
@@ -282,7 +298,7 @@ Revisado em 2026-10-01. Tudo continua somente leitura até a etapa F.
 - **A** (feito): base validada no MT5 real (identidade da conta, horários em UTC, estado da cotação).
 - **B** (feito): calendário econômico (B2), consulta de posições com distâncias e risco até o stop (B1) e journal em SQLite importado do MT5 (B3).
 - **C**: reação observada a eventos e contexto entre ativos para os instrumentos operados (C1) e reações guardadas para estatísticas por tipo de surpresa (C2), ambas feitas. Próximo: notícias, só depois de medir a latência das fontes gratuitas.
-- **D**: backtest de um único setup definido por regras objetivas.
+- **D**: o SMC do usuário é discricionário (sem setup fixo), então a etapa virou ferramentas de estrutura (D1: `estrutura_smc`, feito) e, em seguida, registrar no journal os elementos de cada operação (varredura, CHoCH, OB, FVG, timeframe, sessão) para medir quais combinações funcionam. Backtest só de uma variante que os dados indicarem.
 - **E**: propostas de operação com limites rígidos e aprovação humana fora do chat, ainda sem envio.
 - **F**: execução **somente em conta demo**, com verificação de conta imediatamente antes do envio, reconciliação e kill switch.
 - **G**: coleta contínua, alertas ou dashboard, só se o uso justificar.

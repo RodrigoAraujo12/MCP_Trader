@@ -29,7 +29,7 @@ from trading_mcp.server import create_server
 EXPECTED_TOOLS = {
     "cotacao", "historico", "indicadores", "tamanho_posicao", "info_conta", "posicoes", "simbolos", "calendario",
     "fundamentos", "reacao_evento", "contexto_mercado", "journal_sincronizar", "journal_anotar", "journal_listar", "journal_estatisticas", "journal_exportar",
-    "reacoes_registrar", "reacoes_estatisticas",
+    "reacoes_registrar", "reacoes_estatisticas", "estrutura_smc",
 }
 # Gravam só nos bancos locais (journal e reações); todas as demais são somente leitura.
 JOURNAL_WRITERS = {"journal_sincronizar", "journal_anotar", "journal_exportar", "reacoes_registrar"}
