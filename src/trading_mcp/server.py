@@ -10,6 +10,7 @@ import contextlib
 import logging
 import sys
 from collections.abc import Iterator
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -19,10 +20,11 @@ from mcp_types import ToolAnnotations
 from pydantic import Field
 
 from trading_mcp import contexto_entrada, indicators, posicoes as posicoes_report, reacao, reacoes as reacoes_module
-from trading_mcp import risk, smc, tempo
+from trading_mcp import limites, risk, smc, tempo
 from trading_mcp.calendario import CalendarError, EconomicCalendar
 from trading_mcp.config import Settings, load_settings
 from trading_mcp.journal import Journal, JournalError
+from trading_mcp.limites import LimitesError, ProposalStore, RiskRules
 from trading_mcp.mt5_client import MT5Client, MT5Error
 from trading_mcp.reacoes import ReacoesError, ReactionStore
 from trading_mcp.sec_edgar import SecEdgarClient, SecEdgarError
@@ -96,6 +98,13 @@ Regras de uso:
   contra a operação). Em `por_contexto` cada item é uma leitura isolada; com amostra pequena, não tire regra. Não
   calcule nem mostre quanto a operação poderia ter ganho (máximo a favor, preço depois da saída): o usuário não
   quer essa comparação.
+- Risco (`risco_conta`, `proposta_operacao`): os limites do usuário (`regras` em `risco_conta`; padrão 1,25% por
+  operação, 5% de perda no dia e 25% na semana) valem sobre a base do dia/semana de mercado (17:00 de Nova York;
+  semana a partir de domingo).
+  Para sugerir uma entrada, use `proposta_operacao` (não calcule lote à mão) e apresente o id, o lote, o risco, o
+  tipo de ordem, a validade, as notícias e o contexto. Proposta recusada: explique o motivo e não contorne o limite
+  (nem com outro lote, stop mais curto ou tamanho_posicao). Nunca diga que uma ordem foi enviada: nenhuma tool envia
+  ordens; quem executa é o usuário.
 - Os dados servem para estudo e análise; não são recomendação de investimento.
 """
 
@@ -104,6 +113,8 @@ JOURNAL_READ = ToolAnnotations(read_only_hint=True, open_world_hint=False)
 # Gravam só nos bancos locais (journal e reações); nada é apagado.
 JOURNAL_SYNC = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=True)
 JOURNAL_WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False)
+# Lê o MT5 e o calendário e grava só no banco local das propostas (cada chamada cria uma proposta nova).
+PROPOSAL_WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=True)
 
 
 @contextlib.contextmanager
@@ -113,7 +124,7 @@ def _tool_errors() -> Iterator[None]:
         yield
     except ToolError:
         raise
-    except (MT5Error, SecEdgarError, CalendarError, JournalError, ReacoesError, ValueError) as exc:
+    except (MT5Error, SecEdgarError, CalendarError, JournalError, ReacoesError, LimitesError, ValueError) as exc:
         raise ToolError(str(exc)) from exc
     except Exception as exc:
         # Sem isto o modelo veria só "Error executing tool X", sem pista do que houve.
@@ -148,6 +159,7 @@ def create_server(
     calendar: EconomicCalendar | None = None,
     journal: Journal | None = None,
     reactions: ReactionStore | None = None,
+    proposals: ProposalStore | None = None,
 ) -> MCPServer:
     settings = settings or load_settings()
     mt5 = mt5_client or MT5Client(settings)
@@ -163,6 +175,12 @@ def create_server(
     reactions = reactions or ReactionStore(
         settings.reacoes_path, mt5, calendar, settings.instruments, backup_dir=settings.journal_export_dir
     )
+
+    proposals = proposals or ProposalStore(settings.propostas_path)
+    rules = RiskRules(settings.risk_per_trade_pct, settings.daily_loss_pct, settings.weekly_loss_pct)
+
+    def entry_labels(symbol: str, direction: str, when: datetime, price: float) -> dict[str, str]:
+        return contexto_entrada.dimensions(contexto_entrada.compute(mt5, symbol, direction, when, price), direction)
 
     server = MCPServer(name="trading-mcp", instructions=INSTRUCTIONS, version="0.1.0")
 
@@ -279,8 +297,8 @@ def create_server(
         entrada: Annotated[float, Field(gt=0, description="Preço de entrada")],
         stop: Annotated[float, Field(gt=0, description="Preço do stop loss")],
         risco_percentual: Annotated[
-            float, Field(gt=0, le=100, description="Percentual do saldo a arriscar na operação")
-        ] = 1.0,
+            float, Field(gt=0, le=100, description="Percentual do saldo a arriscar; padrão = o seu limite por operação")
+        ] = settings.risk_per_trade_pct,
         saldo: Annotated[
             float | None, Field(gt=0, description="Saldo base; vazio = saldo atual da conta conectada")
         ] = None,
@@ -315,6 +333,10 @@ def create_server(
                 volume_step=spec["volume_step"],
             )
             warnings = pre_warnings + list(size.warnings)
+            if risco_percentual > rules.per_trade_pct:
+                warnings.append(
+                    f"Risco de {risco_percentual:g}% acima do seu limite de {rules.per_trade_pct:g}% por operação."
+                )
 
             digits = spec["digitos"]
             stop_distance: dict[str, Any] = {
@@ -393,6 +415,43 @@ def create_server(
                 "custos_nao_incluidos": "comissão (contas Raw Spread/Zero cobram por lote) e swap",
                 "avisos": warnings,
             }
+
+    @server.tool(annotations=READ_ONLY)
+    def risco_conta() -> dict[str, Any]:
+        """Seus limites de risco agora: base do dia e da semana de mercado, resultado, perda nos stops abertos e
+        pendentes, quanto ainda cabe no dia e na semana e o risco máximo da próxima operação (o limite por operação,
+        ou menos se faltar espaço). As porcentagens estão em `regras`."""
+        with _tool_errors():
+            return limites.account_limits(mt5, rules)
+
+    @server.tool(annotations=PROPOSAL_WRITE)
+    def proposta_operacao(
+        simbolo: Annotated[str, Field(description="Símbolo, ex.: US30, USTEC, XAUUSD")],
+        entrada: Annotated[float, Field(gt=0, description="Preço de entrada")],
+        stop: Annotated[float, Field(gt=0, description="Preço do stop (abaixo da entrada = compra; acima = venda)")],
+        alvo: Annotated[float | None, Field(gt=0, description="Preço do alvo (opcional)")] = None,
+        validade_min: Annotated[
+            int,
+            Field(ge=limites.MIN_VALIDITY_MIN, le=limites.MAX_VALIDITY_MIN, description="Minutos até a proposta expirar"),
+        ] = limites.DEFAULT_VALIDITY_MIN,
+    ) -> dict[str, Any]:
+        """Monta uma proposta de operação pelas suas regras de risco: lote para o risco máximo permitido, tipo de
+        ordem, risco/retorno, notícias na validade e contexto SMC. Recusa (com o motivo) se estourar um limite, se
+        houver posição sem stop, sem cotação, fora da conta demo ou com o terminal desconectado.
+        NÃO envia ordem: a proposta é guardada com validade e assinatura para você decidir e executar."""
+        with _tool_errors():
+            return limites.propose(mt5, proposals, rules, simbolo, entrada, stop, alvo, validade_min, calendar,
+                                   entry_labels)
+
+    @server.tool(annotations=JOURNAL_READ)
+    def propostas_listar(
+        dias: Annotated[float | None, Field(ge=0, description="Criadas nos últimos N dias; vazio = todas")] = 7,
+        simbolo: Annotated[str, Field(description="Filtrar por símbolo")] = "",
+        limite: Annotated[int, Field(ge=1, le=200, description="Máximo de propostas")] = 30,
+    ) -> dict[str, Any]:
+        """Propostas guardadas, da mais nova para a mais antiga, com a situação (válida, expirada ou recusada)."""
+        with _tool_errors():
+            return proposals.list(mt5.now_utc(), dias, simbolo, limite)
 
     @server.tool(annotations=READ_ONLY)
     def info_conta() -> dict[str, Any]:

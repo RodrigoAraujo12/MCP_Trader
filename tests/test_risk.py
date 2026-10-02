@@ -99,17 +99,16 @@ def test_position_size_cap_at_max():
     assert any("máximo" in w for w in r.warnings)
 
 
-def test_position_size_warns_above_2_percent():
+def test_position_size_has_no_generic_percent_warning():
+    # O limite por operação é do usuário (limites.RiskRules), não um "2%" genérico.
     r = position_size(10_000, 3, 100, 0.01, 100, 0.01)
-    assert r.lots == 3.0
-    assert any("2%" in w for w in r.warnings)
-    assert position_size(10_000, 2, 100, 0.01, 100, 0.01).warnings == ()
+    assert r.lots == 3.0 and r.warnings == ()
 
 
-def test_position_size_min_lot_above_two_percent_both_warnings():
+def test_position_size_min_lot_warning():
     r = position_size(100, 3, 1000, 0.01, 100, 0.01)  # alvo 3 / 1000 -> 0.003
     assert r.lots == 0.0
-    assert len(r.warnings) == 2
+    assert len(r.warnings) == 1 and "lote mínimo" in r.warnings[0]
 
 
 @pytest.mark.parametrize(

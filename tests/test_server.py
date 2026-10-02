@@ -29,10 +29,11 @@ from trading_mcp.server import create_server
 EXPECTED_TOOLS = {
     "cotacao", "historico", "indicadores", "tamanho_posicao", "info_conta", "posicoes", "simbolos", "calendario",
     "fundamentos", "reacao_evento", "contexto_mercado", "journal_sincronizar", "journal_anotar", "journal_listar", "journal_estatisticas", "journal_exportar",
-    "reacoes_registrar", "reacoes_estatisticas", "estrutura_smc",
+    "reacoes_registrar", "reacoes_estatisticas", "estrutura_smc", "risco_conta", "proposta_operacao",
+    "propostas_listar",
 }
-# Gravam só nos bancos locais (journal e reações); todas as demais são somente leitura.
-JOURNAL_WRITERS = {"journal_sincronizar", "journal_anotar", "journal_exportar", "reacoes_registrar"}
+# Gravam só nos bancos locais (journal, reações e propostas); todas as demais são somente leitura.
+JOURNAL_WRITERS = {"journal_sincronizar", "journal_anotar", "journal_exportar", "reacoes_registrar", "proposta_operacao"}
 
 
 @pytest.fixture
@@ -104,6 +105,7 @@ def _server(fake: FakeMT5 | None = None, sec: Any | None = None, calendar: Any |
     settings_kwargs.setdefault("journal_path", scratch / "journal.sqlite3")
     settings_kwargs.setdefault("journal_export_dir", scratch / "export")
     settings_kwargs.setdefault("reacoes_path", scratch / "reacoes.sqlite3")
+    settings_kwargs.setdefault("propostas_path", scratch / "propostas.sqlite3")
     settings = Settings(max_bars=5_000, **settings_kwargs)
     mt5 = MT5Client(settings, mt5_module=fake or _fake_mt5())
     return create_server(settings, mt5, sec or FakeSec(), calendar)
@@ -284,7 +286,9 @@ async def test_tamanho_posicao_forex_buy() -> None:
     # 1% de 10.000 = 100 USD; stop de 20 pips no EURUSD = 200 USD por lote -> 0,50 lote.
     async with Client(_server()) as client:
         data = _payload(
-            await client.call_tool("tamanho_posicao", {"simbolo": "EURUSD", "entrada": 1.1, "stop": 1.098})
+            await client.call_tool(
+                "tamanho_posicao", {"simbolo": "EURUSD", "entrada": 1.1, "stop": 1.098, "risco_percentual": 1}
+            )
         )
     assert data["direcao"] == "compra"
     assert data["lotes"] == pytest.approx(0.5)
@@ -343,7 +347,7 @@ async def test_tamanho_posicao_warns_when_margin_exceeds_free_margin() -> None:
     # Stop de 5 pontos: 1% de 10.000 / 5 USD = 20 lotes -> margem 11.000 > margem livre 10.000.
     async with Client(_server()) as client:
         data = _payload(
-            await client.call_tool("tamanho_posicao", {"simbolo": "EURUSD", "entrada": 1.1, "stop": 1.09995})
+            await client.call_tool("tamanho_posicao", {"simbolo": "EURUSD", "entrada": 1.1, "stop": 1.09995, "risco_percentual": 1})
         )
     assert data["lotes"] == pytest.approx(20)
     assert any("margem livre" in w for w in data["avisos"])
@@ -354,7 +358,7 @@ async def test_tamanho_posicao_stock_cfd_has_no_pips() -> None:
     # AAPL: 1 ação por lote, stop de 5 USD -> perda de 5 USD por lote; 1% de 10.000 = 100 -> 20 lotes.
     async with Client(_server()) as client:
         data = _payload(
-            await client.call_tool("tamanho_posicao", {"simbolo": "AAPL", "entrada": 230.0, "stop": 225.0})
+            await client.call_tool("tamanho_posicao", {"simbolo": "AAPL", "entrada": 230.0, "stop": 225.0, "risco_percentual": 1})
         )
     assert data["lotes"] == pytest.approx(20)
     assert data["distancia_stop"]["pips"] is None
@@ -579,3 +583,36 @@ async def test_calendario_returns_events(tmp_path: Any) -> None:
     assert event["previsao"] == 89.0 and event["realizado"] is None
     assert data["estado"] == "atual"
     assert bad.is_error
+
+
+@pytest.mark.anyio
+async def test_risk_panel_and_proposal_tools_never_send_orders() -> None:
+    fake = _fake_mt5()
+    async with Client(_server(fake)) as client:
+        panel = _payload(await client.call_tool("risco_conta", {}))
+        proposal = _payload(
+            await client.call_tool("proposta_operacao", {"simbolo": "EURUSD", "entrada": 1.099, "stop": 1.097,
+                                                         "alvo": 1.103, "validade_min": 15})
+        )
+        listed = _payload(await client.call_tool("propostas_listar", {}))
+        bad = await client.call_tool("proposta_operacao", {"simbolo": "EURUSD", "entrada": 1.099, "stop": 1.097,
+                                                           "alvo": 1.098})
+    assert panel["regras"] == {**panel["regras"], "por_operacao_pct": 1.25, "dia_pct": 5.0, "semana_pct": 25.0}
+    assert panel["proxima_operacao"]["pode_operar"] is True
+    assert proposal["status"] == "valida" and "nada foi enviado" in proposal["envio"]
+    assert proposal["volume"] > 0 and proposal["risco_pct_base_dia"] <= 1.25
+    assert [p["id"] for p in listed["propostas"]] == [proposal["id"]]
+    assert bad.is_error and "lado do lucro" in _error_text(bad)
+    # O FakeMT5 levanta AssertionError em order_send/order_check: chegar aqui prova que nada foi enviado.
+
+
+@pytest.mark.anyio
+async def test_tamanho_posicao_defaults_to_the_user_limit_and_warns_above_it() -> None:
+    async with Client(_server()) as client:
+        default = _payload(await client.call_tool("tamanho_posicao", {"simbolo": "EURUSD", "entrada": 1.1, "stop": 1.098}))
+        above = _payload(await client.call_tool(
+            "tamanho_posicao", {"simbolo": "EURUSD", "entrada": 1.1, "stop": 1.098, "risco_percentual": 2}))
+    assert default["risco_percentual"] == 1.25 and default["risco_alvo"] == pytest.approx(125.0)
+    assert not any("acima do seu limite" in w for w in default["avisos"])
+    assert any("acima do seu limite de 1.25%" in w for w in above["avisos"])
+

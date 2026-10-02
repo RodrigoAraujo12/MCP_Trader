@@ -33,7 +33,7 @@ ORDER_TYPE_BUY_LIMIT, ORDER_TYPE_SELL_LIMIT, ORDER_TYPE_BUY_STOP, ORDER_TYPE_SEL
 ORDER_TYPE_BUY_STOP_LIMIT, ORDER_TYPE_SELL_STOP_LIMIT, ORDER_TYPE_CLOSE_BY = 6, 7, 8
 ORDER_TIME_GTC, ORDER_TIME_DAY, ORDER_TIME_SPECIFIED, ORDER_TIME_SPECIFIED_DAY = 0, 1, 2, 3
 POSITION_TYPE_BUY, POSITION_TYPE_SELL = 0, 1
-DEAL_TYPE_BUY, DEAL_TYPE_SELL, DEAL_TYPE_BALANCE = 0, 1, 2
+DEAL_TYPE_BUY, DEAL_TYPE_SELL, DEAL_TYPE_BALANCE, DEAL_TYPE_CREDIT, DEAL_TYPE_CHARGE = 0, 1, 2, 3, 4
 DEAL_ENTRY_IN, DEAL_ENTRY_OUT, DEAL_ENTRY_INOUT, DEAL_ENTRY_OUT_BY = 0, 1, 2, 3
 DEAL_REASON_CLIENT, DEAL_REASON_MOBILE, DEAL_REASON_WEB, DEAL_REASON_EXPERT = 0, 1, 2, 3
 DEAL_REASON_SL, DEAL_REASON_TP, DEAL_REASON_SO = 4, 5, 6
@@ -191,9 +191,10 @@ def make_deal(
     )
 
 
-def make_balance_deal(ticket: int, amount: float, time: int) -> Record:
+def make_balance_deal(ticket: int, amount: float, time: int, deal_type: int = DEAL_TYPE_BALANCE) -> Record:
+    """Lançamento fora das operações: depósito/saque (padrão), crédito, tarifa etc."""
     return Record(
-        ticket=ticket, order=0, time=time, time_msc=time * 1000, type=DEAL_TYPE_BALANCE, entry=DEAL_ENTRY_IN, magic=0,
+        ticket=ticket, order=0, time=time, time_msc=time * 1000, type=deal_type, entry=DEAL_ENTRY_IN, magic=0,
         position_id=0, reason=0, volume=0.0, price=0.0, commission=0.0, swap=0.0, profit=amount, fee=0.0, symbol="",
         comment="deposit", external_id="",
     )

@@ -59,6 +59,10 @@ Copy-Item .env.example .env
 | `JOURNAL_EXPORT_DIR` | Pasta das cópias de segurança e CSVs do journal | Não (padrão: `journal_export` no projeto) |
 | `INSTRUMENTOS` | Instrumentos operados, separados por vírgula (reação a eventos e contexto entre ativos) | Não (padrão: `USTEC,US30,JP225,XAUUSD,GBPUSD,EURUSD,BTCUSD,UKOIL,DXY`) |
 | `REACOES_PATH` | Banco das reações guardadas (SQLite) | Não (padrão: `trading-mcp\reacoes.sqlite3` na pasta do seu usuário) |
+| `RISCO_POR_OPERACAO_PCT` | Risco máximo por operação, em % da base do dia | Não (padrão: 1,25) |
+| `PERDA_MAXIMA_DIA_PCT` | Perda máxima no dia de mercado, em % da base do dia | Não (padrão: 5) |
+| `PERDA_MAXIMA_SEMANA_PCT` | Perda máxima na semana de mercado, em % da base da semana | Não (padrão: 25) |
+| `PROPOSTAS_PATH` | Banco das propostas de operação (SQLite) | Não (padrão: `trading-mcp\propostas.sqlite3` na pasta do seu usuário) |
 
 O `.env` é lido da pasta raiz do projeto, mesmo que o servidor seja iniciado de outro lugar (`TRADING_MCP_ENV_FILE` aponta para outro arquivo, se preferir). Arquivos salvos pelo Bloco de Notas (com BOM ou UTF-16) funcionam. O `.env` está no `.gitignore` e nunca deve ir para o git.
 
@@ -80,7 +84,10 @@ Use uma instalação **separada** do MT5, logada **só** na conta demo, e aponte
 | `cotacao` | Última cotação: bid, ask, spread, horário (UTC/São Paulo/Nova York), idade e estado | `simbolo` (ex.: USTEC, EURUSD) |
 | `historico` | Candles OHLC em CSV, com resumo do período | `simbolo`, `timeframe` (M1, M3, M5… MN1; padrão H1), `quantidade` (1–500, padrão 100), `incluir_candle_atual` (padrão: sim) |
 | `indicadores` | RSI, MACD, EMA, SMA, ATR, Bollinger | `simbolo`, `lista` (padrão: RSI(14), MACD(12,26,9), EMA 20/50, ATR(14)), `timeframe`, `incluir_candle_atual` |
-| `tamanho_posicao` | Lote para arriscar X% do saldo | `simbolo`, `entrada`, `stop`, `risco_percentual` (padrão 1%), `saldo` (padrão: saldo da conta) |
+| `tamanho_posicao` | Lote para arriscar X% do saldo (cálculo livre; para os seus limites, use `proposta_operacao`) | `simbolo`, `entrada`, `stop`, `risco_percentual` (padrão: o seu limite por operação, 1,25%), `saldo` (padrão: saldo da conta) |
+| `risco_conta` | Seus limites agora: saldo do início do dia e da semana de mercado, resultado, perda nos stops abertos e pendentes, quanto ainda cabe e o risco máximo da próxima operação | — |
+| `proposta_operacao` | Proposta pelas suas regras (não envia ordem): lote, risco, tipo de ordem, risco/retorno, notícias na validade, contexto SMC; recusa com o motivo se estourar um limite | `simbolo`, `entrada`, `stop`, `alvo` (opcional), `validade_min` (5–240, padrão 30) |
+| `propostas_listar` | Propostas guardadas e a situação (válida, expirada ou recusada) | `dias` (padrão 7), `simbolo`, `limite` |
 | `info_conta` | Saldo, margem, posições abertas e travas de negociação do terminal | — |
 | `posicoes` | Posições abertas e ordens pendentes: estado da cotação, distância até stop e alvo, resultado se forem atingidos, duração e exposição por símbolo | `simbolo` (vazio = todos), `incluir_pendentes` (padrão: sim) |
 | `simbolos` | Busca símbolos disponíveis na conta | `busca` (ex.: USD, Apple), `limite` (1–200, padrão 30) |
@@ -170,6 +177,17 @@ O journal registra as operações da conta demo para medir o que funciona. **O M
 - **Ingredientes seus** (gatilho, timeframe de entrada, confluências): anote em `tags` com `journal_anotar`, sempre com os mesmos nomes; as estatísticas agrupam por tag (uma operação com várias tags conta em cada uma).
 - **Estatísticas**: só operações fechadas; cada grupo mostra o tamanho da amostra e quantas operações ficaram sem R. Calculadas no servidor, sempre do mesmo jeito. Além de setup, símbolo, notícia e direção, saem `por_tag` e `por_contexto` (um agrupamento para cada rótulo do contexto). Cada rótulo é uma leitura isolada: com poucas operações, a diferença entre grupos não prova nada. Não há métrica de quanto a operação poderia ter ganho.
 - **Onde fica**: o banco fica em `trading-mcp\journal.sqlite3` na pasta do seu usuário, fora do OneDrive (sincronizar um banco aberto pode corrompê-lo) e fora do AppData (o Claude Desktop da Microsoft Store redireciona o AppData dos programas que ele abre). `journal_exportar` grava uma cópia do banco e um CSV (separador `;`, vírgula decimal, abre direto no Excel) em `journal_export`, dentro do projeto: como o projeto está no OneDrive, as cópias vão para a nuvem.
+
+## Limites de risco e propostas de operação
+
+As suas regras: **1,25% por operação, 5% de perda no dia e 25% na semana**, sobre o saldo do **início** do dia de mercado (vira às 17:00 de Nova York) e da semana (domingo 17:00 de Nova York). O valor fica fixo durante o período; as porcentagens mudam no `.env`.
+
+- **Base e resultado**: o saldo do início vem do histórico do MT5 (saldo atual menos o que mexeu no saldo desde então). Depósito ou saque dentro do período entra na base, não no resultado: com a conta aberta no meio da semana, a base da semana é o depósito. O resultado inclui as operações (lucro, comissão, swap) e os demais lançamentos (tarifas, juros, dividendos); crédito da corretora fica de fora.
+- **Disponível** = limite + resultado do período − perda nos stops das posições abertas (com o swap já acumulado nelas) − perda nos stops das ordens pendentes (se executadas). É o pior caso se tudo bater no stop agora; lucro já protegido por stop não conta como folga. Posição ou ordem **sem stop** deixa o disponível indeterminado e bloqueia novas propostas.
+- **Proposta** (`proposta_operacao`): lote para o risco máximo permitido (1,25%, ou menos se o dia ou a semana tiverem menos espaço), arredondado para baixo. O tipo de ordem sai do preço atual: **pendente** (limitada ou stop) executa no próprio preço, e o risco é da entrada ao stop; **a mercado**, a compra executa no ask e a venda no bid de agora, e o risco parte desse preço (precisa de cotação atual). Traz o risco/retorno e o valor no alvo, as notícias de importância alta durante a validade (e até 15 min depois) e o contexto SMC da entrada (a favor/contra, como no journal).
+- **Recusa**, com o motivo: dia ou semana no limite, posição ou ordem sem stop, lote mínimo acima do permitido, margem insuficiente, preço de execução já além do stop ou do alvo, sem cotação, conta que não é demo ou terminal sem conexão.
+- **Nada é enviado**: proposta não é ordem. Cada uma fica guardada com validade (padrão 30 min) e uma assinatura HMAC dos parâmetros exatos (conta, símbolo, direção, tipo, entrada, stop, alvo, lote, risco, validade, situação), com a chave num arquivo ao lado do banco (`propostas.chave`). A etapa F só poderá executar, na conta demo, uma proposta válida, íntegra, dentro do prazo e aprovada por você fora do chat, conferindo os limites de novo na hora: propostas não reservam risco entre si (avisa quando as válidas somadas passariam do espaço).
+- **Fora da conta**: comissão, gap e escorregamento no stop. Risco/retorno é a geometria da operação, não a chance de acerto.
 
 ## Exemplos de perguntas
 
@@ -273,6 +291,7 @@ src/trading_mcp/
 ├── smc.py             # Estrutura SMC: topos/fundos, BOS/CHoCH, FVG, order blocks, liquidez, sessões
 ├── indicators.py      # Indicadores técnicos
 ├── risk.py            # Tamanho de posição e arredondamento de lote
+├── limites.py         # Limites de risco do usuário e propostas de operação (sem envio)
 └── sec_edgar.py       # Fundamentos da SEC EDGAR
 
 tests/
@@ -312,6 +331,6 @@ Revisado em 2026-10-01. Tudo continua somente leitura até a etapa F.
 - **B** (feito): calendário econômico (B2), consulta de posições com distâncias e risco até o stop (B1) e journal em SQLite importado do MT5 (B3).
 - **C**: reação observada a eventos e contexto entre ativos para os instrumentos operados (C1) e reações guardadas para estatísticas por tipo de surpresa (C2), ambas feitas. Próximo: notícias, só depois de medir a latência das fontes gratuitas.
 - **D**: o SMC do usuário é discricionário (sem setup fixo), então a etapa virou ferramentas de estrutura (D1: `estrutura_smc`, feito) e o contexto SMC de cada operação no journal (D2, feito: sessão, estrutura, CHoCH, varredura, OB/FVG, premium/discount, medidos sozinhos na hora da entrada, mais as tags do usuário) para medir quais combinações funcionam. Backtest só de uma variante que os dados indicarem.
-- **E**: propostas de operação com limites rígidos e aprovação humana fora do chat, ainda sem envio.
+- **E**: painel dos limites do usuário (1,25% / 5% / 25% sobre o saldo do início do dia e da semana de mercado) e propostas de operação guardadas com validade e assinatura, sem envio (feito). A aprovação fora do chat entra com a execução, na F.
 - **F**: execução **somente em conta demo**, com verificação de conta imediatamente antes do envio, reconciliação e kill switch.
 - **G**: coleta contínua, alertas ou dashboard, só se o uso justificar.

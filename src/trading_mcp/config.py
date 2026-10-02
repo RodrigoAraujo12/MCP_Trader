@@ -19,6 +19,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 # que ele abre) e fora do OneDrive (sincronizar um SQLite aberto pode corrompê-lo).
 DEFAULT_JOURNAL_PATH = Path.home() / "trading-mcp" / "journal.sqlite3"
 DEFAULT_REACOES_PATH = Path.home() / "trading-mcp" / "reacoes.sqlite3"
+DEFAULT_PROPOSTAS_PATH = Path.home() / "trading-mcp" / "propostas.sqlite3"
+# Regras de risco do usuário: % do saldo do início do dia (por operação e por dia) e da semana de mercado.
+DEFAULT_RISK_PER_TRADE_PCT, DEFAULT_DAILY_LOSS_PCT, DEFAULT_WEEKLY_LOSS_PCT = 1.25, 5.0, 25.0
 # Cópias e CSVs são arquivos fechados: dentro do projeto, o OneDrive os leva para a nuvem.
 DEFAULT_JOURNAL_EXPORT_DIR = PROJECT_ROOT / "journal_export"
 # Instrumentos operados pelo usuário: reação a eventos e contexto entre ativos usam esta lista.
@@ -84,6 +87,21 @@ def _get_int(env: dict[str, str], key: str, default: int | None, errors: list[st
         return default
 
 
+def _get_pct(env: dict[str, str], key: str, default: float, errors: list[str]) -> float:
+    value = _get(env, key)
+    if value is None:
+        return default
+    try:
+        number = float(value.replace(",", "."))
+    except ValueError:
+        errors.append(f"{key} deve ser um número (porcentagem), recebido: {value!r}")
+        return default
+    if not 0 < number <= 100:
+        errors.append(f"{key} deve estar entre 0 (exclusivo) e 100, recebido: {value!r}")
+        return default
+    return number
+
+
 @dataclass(frozen=True)
 class Settings:
     # Caminho do terminal64.exe de uma instalação do MT5 dedicada a este servidor.
@@ -106,6 +124,12 @@ class Settings:
     # Banco das reações a eventos guardadas (SQLite), no mesmo lugar do journal.
     reacoes_path: Path = DEFAULT_REACOES_PATH
     instruments: tuple[str, ...] = DEFAULT_INSTRUMENTS
+    # Propostas de operação (etapa E; nada é enviado ao MT5) e os limites de risco do usuário, em % do saldo
+    # do início do dia (por operação e por dia) e da semana de mercado.
+    propostas_path: Path = DEFAULT_PROPOSTAS_PATH
+    risk_per_trade_pct: float = DEFAULT_RISK_PER_TRADE_PCT
+    daily_loss_pct: float = DEFAULT_DAILY_LOSS_PCT
+    weekly_loss_pct: float = DEFAULT_WEEKLY_LOSS_PCT
     # Arquivo .env efetivamente usado (None = nenhum encontrado).
     env_file: str | None = None
     # Problemas encontrados na configuração do MT5.
@@ -141,6 +165,16 @@ def load_settings(env_file: Path | None = None) -> Settings:
         errors.append(f"MAX_BARS deve estar entre 1 e 50000, recebido: {max_bars}")
         max_bars = 5_000
 
+    per_trade = _get_pct(env, "RISCO_POR_OPERACAO_PCT", DEFAULT_RISK_PER_TRADE_PCT, errors)
+    daily = _get_pct(env, "PERDA_MAXIMA_DIA_PCT", DEFAULT_DAILY_LOSS_PCT, errors)
+    weekly = _get_pct(env, "PERDA_MAXIMA_SEMANA_PCT", DEFAULT_WEEKLY_LOSS_PCT, errors)
+    if not per_trade <= daily <= weekly:
+        errors.append(
+            f"Limites de risco fora de ordem: precisa ser por operação ({per_trade}%) <= dia ({daily}%) <= semana "
+            f"({weekly}%). Corrija no .env."
+        )
+        per_trade, daily, weekly = DEFAULT_RISK_PER_TRADE_PCT, DEFAULT_DAILY_LOSS_PCT, DEFAULT_WEEKLY_LOSS_PCT
+
     raw_instruments = _get(env, "INSTRUMENTOS")
     instruments = (
         tuple(dict.fromkeys(i.strip().upper() for i in raw_instruments.split(",") if i.strip()))
@@ -161,6 +195,10 @@ def load_settings(env_file: Path | None = None) -> Settings:
         journal_export_dir=_get_path(env, "JOURNAL_EXPORT_DIR", DEFAULT_JOURNAL_EXPORT_DIR),
         reacoes_path=_get_path(env, "REACOES_PATH", DEFAULT_REACOES_PATH),
         instruments=instruments,
+        propostas_path=_get_path(env, "PROPOSTAS_PATH", DEFAULT_PROPOSTAS_PATH),
+        risk_per_trade_pct=per_trade,
+        daily_loss_pct=daily,
+        weekly_loss_pct=weekly,
         env_file=str(env_file) if env_file.is_file() else None,
         errors=tuple(errors),
     )

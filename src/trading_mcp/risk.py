@@ -4,9 +4,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import ROUND_FLOOR, Decimal
 
-_MAX_RISK_PERCENT_WARN = 2.0
-
-
 @dataclass(frozen=True)
 class PositionSize:
     """Resultado do dimensionamento de posição."""
@@ -113,11 +110,7 @@ def position_size(
         )
         lots = capped
 
-    if risk_percent > _MAX_RISK_PERCENT_WARN:
-        warnings.append(
-            f"Risco de {risk_percent:g}% está acima de 2% por operação (limite prudente comum)."
-        )
-
+    # Limite por operação não é regra genérica daqui: vem das regras do usuário (``limites``).
     risk_actual = lots * loss_per_lot
     return PositionSize(
         lots=lots,

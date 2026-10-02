@@ -293,7 +293,7 @@ def test_client_deals_require_timezone_and_map_fields(tmp_path):
         client.deals(datetime(2026, 9, 30), datetime(2026, 10, 1))
     deals = client.deals(NOW - timedelta(days=3), NOW)
     assert [d["ticket"] for d in deals] == [1, 21, 22, 11, 12, 31]  # do mais antigo ao mais novo
-    assert deals[0]["tipo"] == "outro"  # depósito
+    assert deals[0]["tipo"] == "saldo"  # depósito
     tp_exit = next(d for d in deals if d["ticket"] == 12)
     assert tp_exit["entrada"] == "out" and tp_exit["motivo"] == "alvo" and tp_exit["tipo"] == "sell"
     assert client.position_orders(100)[0]["stop_loss"] == 1.095

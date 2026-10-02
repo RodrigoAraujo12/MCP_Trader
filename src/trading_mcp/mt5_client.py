@@ -90,7 +90,9 @@ ORDER_TIMES = {
     "ORDER_TIME_SPECIFIED": "até a data de expiração",
     "ORDER_TIME_SPECIFIED_DAY": "até o fim do dia da expiração",
 }
-DEAL_TYPES = {"DEAL_TYPE_BUY": "buy", "DEAL_TYPE_SELL": "sell"}  # os demais (saldo, crédito, taxas) = "outro"
+# Depósito/saque = "saldo"; crédito da corretora (não mexe no saldo) = "credito"; tarifas, juros, dividendos,
+# correções etc. = "outro".
+DEAL_TYPES = {"DEAL_TYPE_BUY": "buy", "DEAL_TYPE_SELL": "sell", "DEAL_TYPE_BALANCE": "saldo", "DEAL_TYPE_CREDIT": "credito"}
 DEAL_ENTRIES = {"DEAL_ENTRY_IN": "in", "DEAL_ENTRY_OUT": "out", "DEAL_ENTRY_INOUT": "inout", "DEAL_ENTRY_OUT_BY": "out_by"}
 DEAL_REASONS = {
     "DEAL_REASON_CLIENT": "terminal",

@@ -7,7 +7,8 @@ import pytest
 from trading_mcp.config import load_settings
 
 KEYS = ("MT5_PATH", "MT5_LOGIN", "MT5_PASSWORD", "MT5_SERVER", "MT5_TIMEOUT_MS", "SYMBOL_SUFFIX", "MAX_BARS", "SEC_USER_AGENT",
-        "JOURNAL_PATH", "JOURNAL_EXPORT_DIR", "INSTRUMENTOS")
+        "JOURNAL_PATH", "JOURNAL_EXPORT_DIR", "INSTRUMENTOS", "RISCO_POR_OPERACAO_PCT", "PERDA_MAXIMA_DIA_PCT",
+        "PERDA_MAXIMA_SEMANA_PCT", "PROPOSTAS_PATH")
 
 
 @pytest.fixture(autouse=True)
@@ -107,3 +108,30 @@ def test_journal_paths_expand_home_and_resolve_relative_to_project(tmp_path: Pat
     s = load_settings(_write(tmp_path, "JOURNAL_PATH=~/j.sqlite3\nJOURNAL_EXPORT_DIR=backups\n", "utf-8"))
     assert s.journal_path == Path.home() / "j.sqlite3"
     assert s.journal_export_dir == PROJECT_ROOT / "backups"
+
+
+def test_risk_limits_default_to_the_user_rules(tmp_path: Path) -> None:
+    s = load_settings(tmp_path / "nao_existe.env")
+    assert (s.risk_per_trade_pct, s.daily_loss_pct, s.weekly_loss_pct) == (1.25, 5.0, 25.0)
+    assert s.propostas_path.name == "propostas.sqlite3"
+
+
+def test_risk_limits_accept_comma_decimals(tmp_path: Path) -> None:
+    path = _write(tmp_path, "RISCO_POR_OPERACAO_PCT=1,5\nPERDA_MAXIMA_DIA_PCT=4\nPERDA_MAXIMA_SEMANA_PCT=20\n", "utf-8")
+    s = load_settings(path)
+    assert (s.risk_per_trade_pct, s.daily_loss_pct, s.weekly_loss_pct) == (1.5, 4.0, 20.0) and s.errors == ()
+
+
+@pytest.mark.parametrize(
+    ("text", "message"),
+    [
+        ("RISCO_POR_OPERACAO_PCT=abc\n", "número"),
+        ("PERDA_MAXIMA_DIA_PCT=0\n", "entre 0"),
+        ("PERDA_MAXIMA_SEMANA_PCT=150\n", "entre 0"),
+        ("RISCO_POR_OPERACAO_PCT=6\n", "fora de ordem"),  # 6% por operação > 5% no dia
+    ],
+)
+def test_invalid_risk_limits_are_reported(tmp_path: Path, text: str, message: str) -> None:
+    s = load_settings(_write(tmp_path, text, "utf-8"))
+    assert any(message in e for e in s.errors)
+    assert (s.risk_per_trade_pct, s.daily_loss_pct, s.weekly_loss_pct) == (1.25, 5.0, 25.0)
