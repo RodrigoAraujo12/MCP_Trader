@@ -2,7 +2,7 @@
 
 Servidor MCP (stdio) de análise de mercado para forex e ações dos EUA. Dá ao Claude acesso a cotações, histórico e indicadores técnicos via MetaTrader 5 (Exness), a um calculador de tamanho de posição que usa a especificação real do contrato na corretora, e a fundamentos de empresas americanas via SEC EDGAR.
 
-**Fase 1 (somente leitura)**: as ferramentas consultam dados. Não existe tool para enviar, alterar ou cancelar ordens, e o acesso a essas funções do MetaTrader 5 é bloqueado no código.
+**MT5 somente leitura**: não existe tool para enviar, alterar ou cancelar ordens, e o acesso a essas funções do MetaTrader 5 é bloqueado no código. As únicas gravações são no journal local (um arquivo SQLite no seu computador).
 
 ## Como você usa: interface ou terminal?
 
@@ -55,6 +55,8 @@ Copy-Item .env.example .env
 | `SEC_USER_AGENT` | Identificação exigida pela SEC: `"Seu Nome seu@email.com"` | **Sim** (para `fundamentos`) |
 | `MT5_TIMEOUT_MS` | Timeout de conexão com o MT5, em milissegundos | Não (padrão: 60000) |
 | `MAX_BARS` | Limite de candles buscados por chamada | Não (padrão: 5000) |
+| `JOURNAL_PATH` | Arquivo do journal (SQLite) | Não (padrão: `trading-mcp\journal.sqlite3` na pasta do seu usuário) |
+| `JOURNAL_EXPORT_DIR` | Pasta das cópias de segurança e CSVs do journal | Não (padrão: `journal_export` no projeto) |
 
 O `.env` é lido da pasta raiz do projeto, mesmo que o servidor seja iniciado de outro lugar (`TRADING_MCP_ENV_FILE` aponta para outro arquivo, se preferir). Arquivos salvos pelo Bloco de Notas (com BOM ou UTF-16) funcionam. O `.env` está no `.gitignore` e nunca deve ir para o git.
 
@@ -82,6 +84,11 @@ Use uma instalação **separada** do MT5, logada **só** na conta demo, e aponte
 | `simbolos` | Busca símbolos disponíveis na conta | `busca` (ex.: USD, Apple), `limite` (1–200, padrão 30) |
 | `calendario` | Calendário econômico dos EUA: horário (UTC/SP/NY), importância, realizado, previsão, anterior, anterior revisado e surpresa | `horas_a_frente` (padrão 24), `horas_atras` (padrão 2), `importancia_minima`, `busca` (ex.: CPI, NFP, claims, FOMC) |
 | `fundamentos` | Fundamentos da SEC EDGAR (receita, lucro, LPA, ROE, margem) | `ticker` (ex.: AAPL, MSFT, BRK.B) |
+| `journal_sincronizar` | Importa as operações da conta do histórico do MT5 para o journal (não duplica, não apaga anotações) | `dias` (padrão 7) |
+| `journal_anotar` | Anota uma operação: setup, tags, motivo, observação, stop inicial, notícia | `operacao_id` ou `ticket`, e os campos a gravar |
+| `journal_listar` | Operações com resultado, R, stop inicial, notícia e anotações | `dias` (padrão 30), `simbolo`, `setup`, `status`, `limite` |
+| `journal_estatisticas` | Estatísticas das operações fechadas, por setup, símbolo, notícia e direção | `dias` (vazio = todas), `simbolo`, `setup` |
+| `journal_exportar` | Cópia de segurança do banco e CSV para o Excel | — |
 
 **Estado da cotação**: `atual` (tick com até 60 s), `mercado_fechado_provavel` (sem ticks recentes e sem negociação, na semana anterior, no mesmo intervalo que hoje está sem ticks: pausa diária, fim de semana, fora da sessão), `atrasado` (sem ticks recentes, mas na semana anterior houve negociação nesse intervalo: feriado, atraso ou problema de conexão), `antigo` (não foi possível verificar, ou o último tick tem mais de uma semana), `desconectado` (terminal sem conexão com a corretora) e `horario_inconsistente` (tick à frente do relógio UTC: servidor fora de UTC ou relógio do Windows errado). Só `atual` deve ser tratado como preço de agora.
 
@@ -93,6 +100,15 @@ Use uma instalação **separada** do MT5, logada **só** na conta demo, e aponte
 
 **Tamanho de posição**: a direção é deduzida (stop abaixo da entrada = compra). O resultado traz o risco com o lote arredondado, o efeito do spread atual nas compras (`risco_com_spread`) e a margem estimada. Ele recusa stop menor que o tick do símbolo e avisa quando o spread consome boa parte do stop ou quando a margem passa da margem livre. Comissão e swap não estão incluídos: em contas Raw Spread/Zero, some a comissão por lote.
 
+## Journal
+
+O journal registra as operações da conta demo para medir o que funciona. **O MT5 é a fonte dos fatos**: cada posição vira uma operação, com entrada e saída pelo preço médio dos negócios executados, volume, comissão, swap, resultado líquido, horários e motivo do fechamento (stop, alvo, manual). Você só acrescenta, pelo chat, o que o MT5 não sabe: setup, tags, motivo da entrada e observações.
+
+- **Stop inicial e R**: o stop inicial vem da ordem que abriu a posição (quando o stop foi definido na boleta). Se você só colocou o stop depois, o journal usa o stop visto com a posição aberta na primeira sincronização (marcado como `observado`, porque pode já ter sido movido), ou o que você informar com `journal_anotar`. Risco inicial = perda até esse stop; R = resultado líquido / risco inicial.
+- **Notícia**: a operação é marcada `sim` quando houve evento dos EUA de importância alta entre 30 min antes da entrada e o fechamento, pelo calendário do MT5. O arquivo do calendário cobre só os últimos 7 dias: sincronize pelo menos uma vez por semana, senão a marcação fica `desconhecido`. Você pode corrigir com `journal_anotar`.
+- **Estatísticas**: só operações fechadas; cada grupo mostra o tamanho da amostra e quantas operações ficaram sem R. Calculadas no servidor, sempre do mesmo jeito.
+- **Onde fica**: o banco fica em `trading-mcp\journal.sqlite3` na pasta do seu usuário, fora do OneDrive (sincronizar um banco aberto pode corrompê-lo) e fora do AppData (o Claude Desktop da Microsoft Store redireciona o AppData dos programas que ele abre). `journal_exportar` grava uma cópia do banco e um CSV (separador `;`, vírgula decimal, abre direto no Excel) em `journal_export`, dentro do projeto: como o projeto está no OneDrive, as cópias vão para a nuvem.
+
 ## Exemplos de perguntas
 
 - "Como está o USTEC agora? A cotação é atual?"
@@ -100,6 +116,8 @@ Use uma instalação **separada** do MT5, logada **só** na conta demo, e aponte
 - "O Jobless Claims saiu? Compare realizado, previsão e anterior."
 - "Qual é o RSI e o MACD do EURUSD no H4?"
 - "Quanto perco se os stops das minhas posições forem atingidos? E quanto falta até cada stop?"
+- "Sincroniza o journal e anota a operação de hoje no USTEC: setup OB + FVG, entrei na varredura da mínima de Londres."
+- "Como estão minhas estatísticas por setup? E com notícia e sem notícia?"
 - "Quantos lotes devo usar para arriscar 1% com entrada 1.0850 e stop 1.0820 no EURUSD?"
 - "Mostre os fundamentos da AAPL: receita, lucro, margem e ROE do último ano."
 - "Qual foi a variação percentual do XAUUSD nos últimos 50 candles em D1?"
@@ -180,6 +198,8 @@ src/trading_mcp/
 ├── mt5_client.py      # Cliente MetaTrader 5 (somente leitura, identidade da conta, estado das cotações)
 ├── tempo.py           # Base de tempo: UTC, exibição em São Paulo e Nova York, fim de candle
 ├── calendario.py      # Calendário econômico (lê o arquivo do serviço MQL5)
+├── posicoes.py        # Relatório de posições e ordens pendentes
+├── journal.py         # Journal de operações em SQLite (importado do histórico do MT5)
 ├── indicators.py      # Indicadores técnicos
 ├── risk.py            # Tamanho de posição e arredondamento de lote
 └── sec_edgar.py       # Fundamentos da SEC EDGAR
@@ -210,6 +230,7 @@ mql5/Services/
 - O fuso UTC do servidor precisa ser reconferido depois de 1/11/2026 (fim do horário de verão dos EUA).
 - Calendário: depende do terminal aberto com o serviço rodando. Alguns indicadores ficam sem realizado no calendário do MT5 (em 2026-10-01, o PMI industrial da S&P Global continuava sem valor horas depois da divulgação). A latência da fonte ainda não foi medida numa divulgação real.
 - Posições (`posicoes`): conferido no terminal real em 2026-10-02 com uma venda e uma compra limitada (veja `docs/`); uma posição de compra ainda não foi aberta no terminal real. Comissão não aparece (fica nos negócios do histórico).
+- Journal: conferido no terminal real em 2026-10-02 com uma operação manual de BTCUSDm. O risco inicial usa a cotação de conversão do momento da sincronização (exato para símbolos cotados em dólar, como USTEC e US30). Comissões cobradas por dia ou por mês, fora das operações, não entram no resultado.
 - Para alguns bancos e empresas com duas classes de ações, `caixa` e `acoes_em_circulacao` vêm vazios, com uma observação explicando.
 
 ## Roadmap
@@ -217,7 +238,7 @@ mql5/Services/
 Revisado em 2026-10-01. Tudo continua somente leitura até a etapa F.
 
 - **A** (feito): base validada no MT5 real (identidade da conta, horários em UTC, estado da cotação).
-- **B**: calendário econômico (feito: B2), consulta de posições com distâncias e risco até o stop (feito: B1) e journal manual em SQLite (B3).
+- **B** (feito): calendário econômico (B2), consulta de posições com distâncias e risco até o stop (B1) e journal em SQLite importado do MT5 (B3).
 - **C**: reação observada a eventos (janelas de 1/5/15 min alinhadas em UTC) e contexto entre ativos; notícias só depois de medir a latência das fontes gratuitas.
 - **D**: backtest de um único setup definido por regras objetivas.
 - **E**: propostas de operação com limites rígidos e aprovação humana fora do chat, ainda sem envio.

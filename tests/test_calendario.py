@@ -474,3 +474,26 @@ def test_corrupt_file_is_reported(tmp_path):
     path.write_text("{ quebrado", encoding="utf-8")
     with pytest.raises(CalendarError, match="Não foi possível ler"):
         cal(path).query()
+
+
+def test_events_between_for_journal(tmp_path: Path) -> None:
+    path = write(
+        tmp_path,
+        [
+            ev(1, "Nonfarm Payrolls", "nonfarm-payrolls", unit="JOB", mult="THOUSANDS", digits=0),
+            ev(2, "Fala de dirigente", "fed-speech", importance="MODERATE", kind="EVENT"),
+            ev(3, "Columbus Day", "columbus-day", importance="NONE", kind="HOLIDAY", time_mode="DATE"),
+        ],
+        [val(10, 1, RELEASE), val(11, 2, RELEASE), val(12, 3, RELEASE.replace(hour=0, minute=0))],
+    )
+    cal = EconomicCalendar(lambda: path, now_utc=lambda: NOW)
+    events, covered = cal.events_between(RELEASE - timedelta(minutes=30), RELEASE + timedelta(hours=1))
+    assert covered is True
+    assert [e["codigo"] for e in events] == ["nonfarm-payrolls"]  # só alta, sem feriado
+    assert events[0]["utc"] == "2026-10-01T12:30:00Z" and events[0]["importancia"] == "alta"
+    moderate, _ = cal.events_between(RELEASE - timedelta(minutes=1), RELEASE + timedelta(minutes=1), "moderada")
+    assert {e["codigo"] for e in moderate} == {"nonfarm-payrolls", "fed-speech"}
+    _, old = cal.events_between(NOW - timedelta(days=8), NOW - timedelta(days=7, hours=23))
+    assert old is False  # antes dos 7 dias exportados
+    with pytest.raises(ValueError):
+        cal.events_between(NOW, NOW, "altissima")

@@ -50,6 +50,8 @@ _ALLOWED_CALLS = frozenset(
         "order_calc_margin",
         "positions_get",
         "orders_get",
+        "history_deals_get",
+        "history_orders_get",
     }
 )
 
@@ -84,6 +86,20 @@ ORDER_TIMES = {
     "ORDER_TIME_DAY": "até o fim do dia",
     "ORDER_TIME_SPECIFIED": "até a data de expiração",
     "ORDER_TIME_SPECIFIED_DAY": "até o fim do dia da expiração",
+}
+DEAL_TYPES = {"DEAL_TYPE_BUY": "buy", "DEAL_TYPE_SELL": "sell"}  # os demais (saldo, crédito, taxas) = "outro"
+DEAL_ENTRIES = {"DEAL_ENTRY_IN": "in", "DEAL_ENTRY_OUT": "out", "DEAL_ENTRY_INOUT": "inout", "DEAL_ENTRY_OUT_BY": "out_by"}
+DEAL_REASONS = {
+    "DEAL_REASON_CLIENT": "terminal",
+    "DEAL_REASON_MOBILE": "celular",
+    "DEAL_REASON_WEB": "web",
+    "DEAL_REASON_EXPERT": "robo",
+    "DEAL_REASON_SL": "stop",
+    "DEAL_REASON_TP": "alvo",
+    "DEAL_REASON_SO": "stop_out",
+    "DEAL_REASON_ROLLOVER": "rolagem",
+    "DEAL_REASON_VMARGIN": "margem_variacao",
+    "DEAL_REASON_SPLIT": "desdobramento",
 }
 
 
@@ -836,3 +852,71 @@ class MT5Client:
             return risk.profit_from_ticks(side_key, volume, price_open, price_close, info.trade_tick_size, tick_value)
         except ValueError as exc:
             raise MT5Error(f"Sem valor do tick para calcular o resultado em {resolved}: {exc}") from exc
+
+    # ------------------------------------------------------------------ histórico
+    def _deal_record(self, d: Any, types: dict, entries: dict, reasons: dict) -> dict:
+        return {
+            "ticket": d.ticket,
+            "ordem": d.order,
+            "posicao_id": d.position_id,
+            "horario": self._epoch_ms(d, "time"),
+            "tipo": types.get(d.type, "outro"),
+            "entrada": entries.get(d.entry, "desconhecida"),
+            "motivo": reasons.get(d.reason, "desconhecido"),
+            "volume": d.volume,
+            "preco": d.price,
+            "comissao": d.commission,
+            "swap": d.swap,
+            "lucro": d.profit,
+            "taxa": getattr(d, "fee", 0.0),
+            "simbolo": d.symbol,
+        }
+
+    def _deal_maps(self) -> tuple[dict, dict, dict]:
+        mt5 = self._module()
+
+        def build(table: dict[str, str]) -> dict:
+            return {getattr(mt5, const): name for const, name in table.items() if hasattr(mt5, const)}
+
+        return build(DEAL_TYPES), build(DEAL_ENTRIES), build(DEAL_REASONS)
+
+    @_guard
+    def deals(self, start: datetime | None = None, end: datetime | None = None, *, position: int | None = None) -> list[dict]:
+        """Negócios (execuções) do histórico: por intervalo UTC ou de uma posição, do mais antigo ao mais novo.
+
+        As datas vão com fuso: datetime sem fuso é lido pelo MT5 como horário local do Windows
+        (conferido em 2026-10-02: a janela 04–05 UTC sem fuso não trouxe nada).
+        """
+        with self._lock:
+            self.ensure_connected()
+            if position is not None:
+                items = self._call("history_deals_get", position=int(position))
+            else:
+                if start is None or end is None or start.tzinfo is None or end.tzinfo is None:
+                    raise ValueError("Informe início e fim do histórico com fuso horário (UTC).")
+                items = self._call("history_deals_get", start.astimezone(timezone.utc), end.astimezone(timezone.utc))
+            if items is None:
+                raise MT5Error(f"Não foi possível ler o histórico de negócios: {self._last_error()}")
+            maps = self._deal_maps()
+            out = [self._deal_record(d, *maps) for d in items]
+        return sorted(out, key=lambda d: (d["horario"], d["ticket"]))
+
+    @_guard
+    def position_orders(self, position: int) -> list[dict]:
+        """Ordens do histórico ligadas a uma posição (preço, stop e alvo como foram enviados)."""
+        with self._lock:
+            self.ensure_connected()
+            items = self._call("history_orders_get", position=int(position))
+            if items is None:
+                raise MT5Error(f"Não foi possível ler as ordens da posição {position}: {self._last_error()}")
+            return [
+                {
+                    "ticket": o.ticket,
+                    "tipo": o.type,
+                    "colocada": self._epoch_ms(o, "time_setup"),
+                    "preco": o.price_open,
+                    "stop_loss": o.sl or None,
+                    "take_profit": o.tp or None,
+                }
+                for o in items
+            ]

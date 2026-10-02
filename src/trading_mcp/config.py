@@ -15,6 +15,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+# Fora do AppData (o Claude Desktop instalado pela Microsoft Store redireciona o AppData dos processos
+# que ele abre) e fora do OneDrive (sincronizar um SQLite aberto pode corrompê-lo).
+DEFAULT_JOURNAL_PATH = Path.home() / "trading-mcp" / "journal.sqlite3"
+# Cópias e CSVs são arquivos fechados: dentro do projeto, o OneDrive os leva para a nuvem.
+DEFAULT_JOURNAL_EXPORT_DIR = PROJECT_ROOT / "journal_export"
 
 
 def _decode(data: bytes) -> str:
@@ -92,6 +97,9 @@ class Settings:
     max_bars: int = 5_000
     # Exigido pela SEC: "Seu Nome seu@email.com".
     sec_user_agent: str | None = None
+    # Banco do journal (SQLite) e pasta das exportações/cópias de segurança.
+    journal_path: Path = DEFAULT_JOURNAL_PATH
+    journal_export_dir: Path = DEFAULT_JOURNAL_EXPORT_DIR
     # Arquivo .env efetivamente usado (None = nenhum encontrado).
     env_file: str | None = None
     # Problemas encontrados na configuração do MT5.
@@ -126,6 +134,8 @@ def load_settings(env_file: Path | None = None) -> Settings:
         symbol_suffix=_get(env, "SYMBOL_SUFFIX"),
         max_bars=max_bars,
         sec_user_agent=_get(env, "SEC_USER_AGENT"),
+        journal_path=Path(_get(env, "JOURNAL_PATH") or DEFAULT_JOURNAL_PATH),
+        journal_export_dir=Path(_get(env, "JOURNAL_EXPORT_DIR") or DEFAULT_JOURNAL_EXPORT_DIR),
         env_file=str(env_file) if env_file.is_file() else None,
         errors=tuple(errors),
     )

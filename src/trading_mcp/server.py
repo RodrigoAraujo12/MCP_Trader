@@ -1,6 +1,7 @@
 """Servidor MCP (stdio) de análise de mercado: forex e ações dos EUA.
 
-Fase 1: somente leitura. Nenhuma tool envia, altera ou cancela ordens.
+O MT5 é só lido: nenhuma tool envia, altera ou cancela ordens. As tools journal_* gravam apenas no
+arquivo local do journal.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from pydantic import Field
 from trading_mcp import indicators, posicoes as posicoes_report, risk, tempo
 from trading_mcp.calendario import CalendarError, EconomicCalendar
 from trading_mcp.config import Settings, load_settings
+from trading_mcp.journal import Journal, JournalError
 from trading_mcp.mt5_client import MT5Client, MT5Error
 from trading_mcp.sec_edgar import SecEdgarClient, SecEdgarError
 
@@ -35,7 +37,7 @@ CALENDAR_COUNTRY = "US"
 
 INSTRUCTIONS = """\
 Servidor de dados de mercado (forex e CFDs de ações dos EUA via MetaTrader 5 / Exness; fundamentos via SEC EDGAR).
-Somente leitura: não existe tool para enviar ordens.
+Não existe tool para enviar ordens: o MT5 só é lido. As tools journal_* gravam apenas no journal local.
 
 Regras de uso:
 - Para tamanho de lote, use SEMPRE a tool `tamanho_posicao` em vez de calcular manualmente: ela usa a
@@ -64,10 +66,18 @@ Regras de uso:
   não zero. Com `estimativa` revisada, o `anterior` é a estimativa anterior do mesmo período. Separe o
   fato publicado da sua interpretação e não transforme surpresa em compra ou venda. Para medir reação
   de preço, use horários UTC alinhados e cite os eventos de `mesmo_horario`.
+- Journal: rode `journal_sincronizar` antes de listar, anotar ou tirar estatísticas (importa do MT5 sem
+  duplicar e sem apagar anotações). Use `journal_anotar` para setup, motivo, observações e o stop inicial
+  quando faltar; reaproveite os nomes de `setups_existentes`. As estatísticas vêm prontas do servidor: não
+  recalcule; cite o tamanho da amostra e os dados faltantes (sem stop inicial = sem R).
 - Os dados servem para estudo e análise; não são recomendação de investimento.
 """
 
 READ_ONLY = ToolAnnotations(read_only_hint=True, open_world_hint=True)
+JOURNAL_READ = ToolAnnotations(read_only_hint=True, open_world_hint=False)
+# Gravam só no journal local; nada é apagado.
+JOURNAL_SYNC = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=True)
+JOURNAL_WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False)
 
 
 @contextlib.contextmanager
@@ -77,7 +87,7 @@ def _tool_errors() -> Iterator[None]:
         yield
     except ToolError:
         raise
-    except (MT5Error, SecEdgarError, CalendarError, ValueError) as exc:
+    except (MT5Error, SecEdgarError, CalendarError, JournalError, ValueError) as exc:
         raise ToolError(str(exc)) from exc
     except Exception as exc:
         # Sem isto o modelo veria só "Error executing tool X", sem pista do que houve.
@@ -110,6 +120,7 @@ def create_server(
     mt5_client: MT5Client | None = None,
     sec_client: SecEdgarClient | None = None,
     calendar: EconomicCalendar | None = None,
+    journal: Journal | None = None,
 ) -> MCPServer:
     settings = settings or load_settings()
     mt5 = mt5_client or MT5Client(settings)
@@ -117,6 +128,7 @@ def create_server(
     calendar = calendar or EconomicCalendar(
         lambda: Path(mt5.terminal_data_path()) / "MQL5" / "Files" / "trading_mcp" / f"calendar_{CALENDAR_COUNTRY}.json"
     )
+    journal = journal or Journal(settings.journal_path, settings.journal_export_dir, mt5, calendar)
 
     server = MCPServer(name="trading-mcp", instructions=INSTRUCTIONS, version="0.1.0")
 
@@ -422,6 +434,76 @@ def create_server(
                 search=busca,
                 limit=limite,
             )
+
+    @server.tool(annotations=JOURNAL_SYNC)
+    def journal_sincronizar(
+        dias: Annotated[float, Field(gt=0, le=366, description="Dias de histórico do MT5 a importar")] = 7,
+    ) -> dict[str, Any]:
+        """Importa para o journal local as operações da conta (posições do MT5): entrada, saída, volume, custos,
+        resultado, stop inicial e notícia durante a operação. Pode rodar sempre: não duplica nem apaga anotações.
+        """
+        with _tool_errors():
+            return journal.sync(dias)
+
+    @server.tool(annotations=JOURNAL_WRITE)
+    def journal_anotar(
+        operacao_id: Annotated[int | None, Field(description="id da operação no journal")] = None,
+        ticket: Annotated[int | None, Field(description="ticket da posição no MT5 (alternativa ao id)")] = None,
+        setup: Annotated[str | None, Field(description="Nome do setup (reaproveite os já usados)")] = None,
+        tags: Annotated[str | None, Field(description="Tags separadas por vírgula (substitui as atuais)")] = None,
+        motivo: Annotated[str | None, Field(description="Motivo da entrada")] = None,
+        observacao: Annotated[str | None, Field(description="Observação; é acrescentada com data e hora")] = None,
+        stop_inicial: Annotated[
+            float | None, Field(gt=0, description="Stop original, quando o MT5 não registrou ou registrou outro")
+        ] = None,
+        noticia: Annotated[
+            Literal["sim", "nao"] | None, Field(description="Corrige a marcação de notícia durante a operação")
+        ] = None,
+    ) -> dict[str, Any]:
+        """Anota uma operação do journal (setup, tags, motivo, observação, stop inicial, notícia).
+        Os dados de execução vêm do MT5 e não mudam aqui.
+        """
+        with _tool_errors():
+            return journal.annotate(
+                operation_id=operacao_id,
+                ticket=ticket,
+                setup=setup,
+                tags=tags,
+                reason=motivo,
+                note=observacao,
+                initial_stop=stop_inicial,
+                news=noticia,
+            )
+
+    @server.tool(annotations=JOURNAL_READ)
+    def journal_listar(
+        dias: Annotated[float | None, Field(ge=0, description="Operações abertas nos últimos N dias; vazio = todas")] = 30,
+        simbolo: Annotated[str, Field(description="Filtrar por símbolo, ex.: USTEC")] = "",
+        setup: Annotated[str, Field(description="Filtrar por setup")] = "",
+        status: Annotated[Literal["aberta", "parcial", "fechada"] | None, Field(description="Filtrar por status")] = None,
+        limite: Annotated[int, Field(ge=1, le=200, description="Máximo de operações")] = 30,
+    ) -> dict[str, Any]:
+        """Operações do journal, da mais recente para a mais antiga, com resultado, R, stop inicial, notícia e
+        anotações. Traz também os setups já usados."""
+        with _tool_errors():
+            return journal.list_operations(days=dias, symbol=simbolo, setup=setup, status=status, limit=limite)
+
+    @server.tool(annotations=JOURNAL_READ)
+    def journal_estatisticas(
+        dias: Annotated[float | None, Field(ge=0, description="Fechadas nos últimos N dias; vazio = todas")] = None,
+        simbolo: Annotated[str, Field(description="Filtrar por símbolo")] = "",
+        setup: Annotated[str, Field(description="Filtrar por setup")] = "",
+    ) -> dict[str, Any]:
+        """Estatísticas das operações fechadas: quantidade, taxa de acerto, resultado, ganho e perda médios,
+        fator de lucro, R; por setup, símbolo, notícia e direção, com tamanho da amostra e dados faltantes."""
+        with _tool_errors():
+            return journal.stats(days=dias, symbol=simbolo, setup=setup)
+
+    @server.tool(annotations=JOURNAL_WRITE)
+    def journal_exportar() -> dict[str, Any]:
+        """Grava uma cópia de segurança do journal e um CSV das operações (abre no Excel) na pasta de exportação."""
+        with _tool_errors():
+            return journal.export()
 
     @server.tool(annotations=READ_ONLY)
     def fundamentos(

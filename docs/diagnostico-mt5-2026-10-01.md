@@ -82,6 +82,14 @@ Conferido com uma venda a mercado de 0,01 BTCUSDm (stop e alvo) e uma compra lim
 - BTCUSDm é classificado como forex pelo `trade_calc_mode`: aparece "pips" igual aos pontos. Não afeta os índices.
 - O relatório `posicoes` conferiu à mão: distâncias, resultado no stop/alvo, relação alvo/stop, tempo aberta e totais.
 
+## Histórico de negócios (etapa B3, 2026-10-02 ~04:20 UTC)
+
+- `history_deals_get` com `datetime` **sem fuso** é lido como horário local do Windows (UTC−3 aqui): a janela 04:00–05:00 sem fuso não trouxe nada; com fuso UTC ou com epoch inteiro, trouxe os 2 negócios. O cliente sempre manda datas com fuso.
+- Campos do negócio: `ticket, order, time, time_msc, type, entry, magic, position_id, reason, volume, price, commission, swap, profit, fee, symbol, comment, external_id`. O depósito inicial aparece como `type` 2 (saldo), `position_id` 0.
+- A ordem a mercado guarda o stop e o alvo enviados na boleta (`sl` 85726,68 / `tp` 85002,95), e o preço pedido difere da execução (ordem 85571,1; negócio 85585,85). Por isso a entrada vem do negócio e o stop inicial da ordem.
+- Fechamento manual pelo terminal: negócio de saída com `reason` 0 (cliente) e ordem própria sem stop/alvo. A ordem pendente cancelada ficou no histórico com `state` 2 e `position_id` 0.
+- Journal sincronizado com essa operação: entrada 85585,85, saída 85448,40, +1,38, risco inicial 1,41, R 0,98; a segunda sincronização não duplicou.
+
 ## Ainda não reproduzido no terminal real
 
 - Troca de conta e perda de conexão com o servidor em execução. Estão cobertas por testes com MT5 simulado.

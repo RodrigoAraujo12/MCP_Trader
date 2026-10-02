@@ -6,7 +6,8 @@ import pytest
 
 from trading_mcp.config import load_settings
 
-KEYS = ("MT5_PATH", "MT5_LOGIN", "MT5_PASSWORD", "MT5_SERVER", "MT5_TIMEOUT_MS", "SYMBOL_SUFFIX", "MAX_BARS", "SEC_USER_AGENT")
+KEYS = ("MT5_PATH", "MT5_LOGIN", "MT5_PASSWORD", "MT5_SERVER", "MT5_TIMEOUT_MS", "SYMBOL_SUFFIX", "MAX_BARS", "SEC_USER_AGENT",
+        "JOURNAL_PATH", "JOURNAL_EXPORT_DIR")
 
 
 @pytest.fixture(autouse=True)
@@ -82,3 +83,13 @@ def test_env_file_override_variable(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     s = load_settings()
     assert s.symbol_suffix == "c"
     assert s.env_file == str(path)
+
+
+def test_journal_paths_default_outside_appdata_and_overridable(tmp_path: Path) -> None:
+    s = load_settings(tmp_path / "nao_existe.env")
+    assert s.journal_path == Path.home() / "trading-mcp" / "journal.sqlite3"
+    assert "AppData" not in str(s.journal_path)
+    text = f"JOURNAL_PATH={tmp_path / 'j.sqlite3'}\nJOURNAL_EXPORT_DIR={tmp_path / 'exp'}\n"
+    path = _write(tmp_path, text, "utf-8")
+    s = load_settings(path)
+    assert s.journal_path == tmp_path / "j.sqlite3" and s.journal_export_dir == tmp_path / "exp"

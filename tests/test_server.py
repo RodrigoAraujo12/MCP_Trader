@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import random
+import tempfile
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -26,8 +28,10 @@ from trading_mcp.server import create_server
 
 EXPECTED_TOOLS = {
     "cotacao", "historico", "indicadores", "tamanho_posicao", "info_conta", "posicoes", "simbolos", "calendario",
-    "fundamentos",
+    "fundamentos", "journal_sincronizar", "journal_anotar", "journal_listar", "journal_estatisticas", "journal_exportar",
 }
+# Gravam só no arquivo local do journal; todas as demais são somente leitura.
+JOURNAL_WRITERS = {"journal_sincronizar", "journal_anotar", "journal_exportar"}
 
 
 @pytest.fixture
@@ -94,6 +98,10 @@ class FakeSec:
 
 
 def _server(fake: FakeMT5 | None = None, sec: Any | None = None, calendar: Any | None = None, **settings_kwargs: Any):
+    # Nunca o journal real do usuário (~/trading-mcp).
+    scratch = Path(tempfile.mkdtemp(prefix="journal-test-"))
+    settings_kwargs.setdefault("journal_path", scratch / "journal.sqlite3")
+    settings_kwargs.setdefault("journal_export_dir", scratch / "export")
     settings = Settings(max_bars=5_000, **settings_kwargs)
     mt5 = MT5Client(settings, mt5_module=fake or _fake_mt5())
     return create_server(settings, mt5, sec or FakeSec(), calendar)
@@ -114,13 +122,48 @@ def _error_text(result: Any) -> str:
 
 
 @pytest.mark.anyio
-async def test_lists_only_read_only_tools() -> None:
+async def test_only_journal_tools_write_and_none_is_destructive() -> None:
     async with Client(_server()) as client:
         tools = (await client.list_tools()).tools
     assert {t.name for t in tools} == EXPECTED_TOOLS
     for tool in tools:
-        assert tool.annotations is not None and tool.annotations.read_only_hint is True
-        assert tool.description
+        assert tool.annotations is not None and tool.description
+        if tool.name in JOURNAL_WRITERS:
+            assert tool.annotations.read_only_hint is False and tool.annotations.destructive_hint is False
+        else:
+            assert tool.annotations.read_only_hint is True
+
+
+@pytest.mark.anyio
+async def test_journal_tools_end_to_end(tmp_path: Any) -> None:
+    import time
+
+    from fake_mt5 import DEAL_ENTRY_IN, DEAL_ENTRY_OUT, DEAL_REASON_SL, make_deal
+
+    now = int(time.time())
+    fake = _fake_mt5(
+        deals=[
+            make_deal(1, 70, "EURUSDm", "buy", DEAL_ENTRY_IN, 0.1, 1.1, now - 7200, order=70),
+            make_deal(2, 70, "EURUSDm", "sell", DEAL_ENTRY_OUT, 0.1, 1.098, now - 3600, order=71,
+                      reason=DEAL_REASON_SL, profit=-20.0),
+        ],
+    )
+    db = tmp_path / "journal.sqlite3"
+    async with Client(_server(fake, journal_path=db, journal_export_dir=tmp_path / "exp")) as client:
+        empty = await client.call_tool("journal_listar", {})
+        synced = _payload(await client.call_tool("journal_sincronizar", {}))
+        noted = _payload(await client.call_tool("journal_anotar", {"ticket": 70, "stop_inicial": 1.098, "setup": "OB"}))
+        listed = _payload(await client.call_tool("journal_listar", {"dias": None}))
+        stats = _payload(await client.call_tool("journal_estatisticas", {}))
+        exported = _payload(await client.call_tool("journal_exportar", {}))
+        both = await client.call_tool("journal_anotar", {"ticket": 70, "operacao_id": 1, "setup": "x"})
+    assert "journal_sincronizar" in _error_text(empty)
+    assert synced["operacoes_novas"] == 1 and synced["sem_stop_inicial"][0]["ticket"] == 70
+    assert noted["risco_inicial"] == pytest.approx(20.0) and noted["r"] == -1.0 and noted["setup"] == "OB"
+    assert listed["operacoes"][0]["fechamento_motivo"] == "stop"
+    assert stats["geral"]["operacoes"] == 1 and stats["geral"]["r"]["r_medio"] == -1.0
+    assert Path(exported["csv"]).is_file() and Path(exported["copia_do_banco"]).is_file()
+    assert "exatamente um" in _error_text(both)
 
 
 @pytest.mark.anyio
@@ -451,7 +494,12 @@ async def test_stdio_server_starts_from_other_cwd(tmp_path: Any) -> None:
 
     from mcp import StdioServerParameters
 
-    env = {**os.environ, "TRADING_MCP_ENV_FILE": str(tmp_path / "nenhum.env")}
+    env = {
+        **os.environ,
+        "TRADING_MCP_ENV_FILE": str(tmp_path / "nenhum.env"),
+        "JOURNAL_PATH": str(tmp_path / "journal.sqlite3"),
+        "JOURNAL_EXPORT_DIR": str(tmp_path / "exp"),
+    }
     params = StdioServerParameters(command=sys.executable, args=["-m", "trading_mcp"], env=env, cwd=str(tmp_path))
     async with Client(params) as client:
         tools = (await client.list_tools()).tools

@@ -339,6 +339,44 @@ class EconomicCalendar:
             "observacoes": notes,
         }
 
+    def events_between(
+        self, start: datetime, end: datetime, min_importance: str = "alta"
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Eventos com horário exato entre ``start`` e ``end`` e se o arquivo cobre esse intervalo.
+
+        Feriados e eventos de dia inteiro ficam de fora: não marcam um instante de divulgação.
+        """
+        level = IMPORTANCE_LEVELS.get((min_importance or "").strip().lower())
+        if level is None:
+            raise ValueError(f"importancia_minima deve ser baixa, moderada ou alta (recebido: {min_importance!r}).")
+        data = self._load()
+        offset = round(int(data.get("server_gmt_offset_s") or 0) / _OFFSET_STEP_S) * _OFFSET_STEP_S
+        generated = tempo.from_epoch(int(data["generated_gmt"]))
+        first = generated - timedelta(days=int(data.get("days_back") or 0))
+        last = generated + timedelta(days=int(data.get("days_ahead") or 0))
+        covered = first <= start and end <= last
+        events = {ev["id"]: ev for ev in data.get("events", []) if isinstance(ev, dict) and "id" in ev}
+        out: list[dict[str, Any]] = []
+        for value in data.get("values", []):
+            ev = events.get(value.get("event_id")) if isinstance(value, dict) else None
+            if ev is None or _TIME_MODE.get(_suffix(ev.get("time_mode"))) != "exato":
+                continue
+            importance = _IMPORTANCE.get(_suffix(ev.get("importance")), 0)
+            if _suffix(ev.get("type")) == "HOLIDAY" or importance < level:
+                continue
+            when = tempo.from_epoch(int(value["time"]) - offset)
+            if start <= when <= end:
+                code = str(ev.get("event_code") or "")
+                out.append(
+                    {
+                        "utc": tempo.iso_utc(when),
+                        "codigo": code,
+                        "evento": KEY_EVENTS.get(code, ev.get("name")),
+                        "importancia": _IMPORTANCE_PT[importance],
+                    }
+                )
+        return sorted(out, key=lambda e: (e["utc"], e["codigo"])), covered
+
     # ------------------------------------------------------------------ evento
     @staticmethod
     def _event_row(

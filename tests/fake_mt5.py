@@ -28,6 +28,10 @@ ORDER_TYPE_BUY_LIMIT, ORDER_TYPE_SELL_LIMIT, ORDER_TYPE_BUY_STOP, ORDER_TYPE_SEL
 ORDER_TYPE_BUY_STOP_LIMIT, ORDER_TYPE_SELL_STOP_LIMIT, ORDER_TYPE_CLOSE_BY = 6, 7, 8
 ORDER_TIME_GTC, ORDER_TIME_DAY, ORDER_TIME_SPECIFIED, ORDER_TIME_SPECIFIED_DAY = 0, 1, 2, 3
 POSITION_TYPE_BUY, POSITION_TYPE_SELL = 0, 1
+DEAL_TYPE_BUY, DEAL_TYPE_SELL, DEAL_TYPE_BALANCE = 0, 1, 2
+DEAL_ENTRY_IN, DEAL_ENTRY_OUT, DEAL_ENTRY_INOUT, DEAL_ENTRY_OUT_BY = 0, 1, 2, 3
+DEAL_REASON_CLIENT, DEAL_REASON_MOBILE, DEAL_REASON_WEB, DEAL_REASON_EXPERT = 0, 1, 2, 3
+DEAL_REASON_SL, DEAL_REASON_TP, DEAL_REASON_SO = 4, 5, 6
 
 ACCOUNT_TRADE_MODE_DEMO, ACCOUNT_TRADE_MODE_CONTEST, ACCOUNT_TRADE_MODE_REAL = 0, 1, 2
 
@@ -155,6 +159,40 @@ def make_order(
     )
 
 
+def make_deal(
+    ticket: int,
+    position_id: int,
+    symbol: str,
+    side: str,
+    entry: int,
+    volume: float,
+    price: float,
+    time: int,
+    *,
+    order: int | None = None,
+    reason: int = DEAL_REASON_CLIENT,
+    profit: float = 0.0,
+    commission: float = 0.0,
+    swap: float = 0.0,
+    fee: float = 0.0,
+) -> Record:
+    """Negócio como o de history_deals_get."""
+    return Record(
+        ticket=ticket, order=order if order is not None else ticket, time=time, time_msc=time * 1000,
+        type=DEAL_TYPE_BUY if side == "buy" else DEAL_TYPE_SELL, entry=entry, magic=0, position_id=position_id,
+        reason=reason, volume=volume, price=price, commission=commission, swap=swap, profit=profit, fee=fee,
+        symbol=symbol, comment="", external_id="",
+    )
+
+
+def make_balance_deal(ticket: int, amount: float, time: int) -> Record:
+    return Record(
+        ticket=ticket, order=0, time=time, time_msc=time * 1000, type=DEAL_TYPE_BALANCE, entry=DEAL_ENTRY_IN, magic=0,
+        position_id=0, reason=0, volume=0.0, price=0.0, commission=0.0, swap=0.0, profit=amount, fee=0.0, symbol="",
+        comment="deposit", external_id="",
+    )
+
+
 def make_rates(closes: list[float], *, start_time: int = 1_700_000_000, step_seconds: int = 3600, spread: int = 12):
     """Gera candles a partir de uma lista de fechamentos (open = fechamento anterior)."""
     rows = []
@@ -182,6 +220,8 @@ class FakeMT5:
         connected: bool = True,
         positions: list[Record] | None = None,
         orders: list[Record] | None = None,
+        deals: list[Record] | None = None,
+        history_orders: list[Record] | None = None,
         login: int = 12345678,
         zero_tick_symbols: set[str] | None = None,
         rates_fail_times: int = 0,
@@ -206,6 +246,8 @@ class FakeMT5:
         self.connected = connected
         self.positions = positions or []
         self.orders = orders or []
+        self.deals = deals or []
+        self.history_orders = history_orders or []
         self.login = login
         self.zero_tick_symbols: set[str] = set(zero_tick_symbols or ())
         self.rates_fail_times = rates_fail_times
@@ -361,6 +403,26 @@ class FakeMT5:
             return None
         items = self.orders if symbol is None else [o for o in self.orders if o.symbol == symbol]
         return tuple(items)
+
+    def history_deals_get(self, date_from: Any = None, date_to: Any = None, *, position: int | None = None, **kwargs: Any):
+        if not self.initialized:
+            return None
+        if position is not None:
+            return tuple(d for d in self.deals if d.position_id == position)
+        # O MT5 real lê datetime sem fuso como horário local do Windows: o cliente nunca pode mandar assim.
+        for moment in (date_from, date_to):
+            if isinstance(moment, datetime) and moment.tzinfo is None:
+                raise AssertionError("history_deals_get recebeu datetime sem fuso")
+        lo, hi = int(date_from.timestamp()), int(date_to.timestamp())
+        return tuple(d for d in self.deals if lo <= d.time <= hi)
+
+    def history_orders_get(self, date_from: Any = None, date_to: Any = None, *, position: int | None = None, **kwargs: Any):
+        if not self.initialized:
+            return None
+        if position is not None:
+            return tuple(o for o in self.history_orders if o.position_id == position)
+        lo, hi = int(date_from.timestamp()), int(date_to.timestamp())
+        return tuple(o for o in self.history_orders if lo <= o.time_setup <= hi)
 
     # --- proibido na fase 1 ---------------------------------------------
     def order_send(self, *args: Any, **kwargs: Any):
