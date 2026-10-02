@@ -18,11 +18,12 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import ToolAnnotations
 from pydantic import Field
 
-from trading_mcp import indicators, posicoes as posicoes_report, reacao, risk, tempo
+from trading_mcp import indicators, posicoes as posicoes_report, reacao, reacoes as reacoes_module, risk, tempo
 from trading_mcp.calendario import CalendarError, EconomicCalendar
 from trading_mcp.config import Settings, load_settings
 from trading_mcp.journal import Journal, JournalError
 from trading_mcp.mt5_client import MT5Client, MT5Error
+from trading_mcp.reacoes import ReacoesError, ReactionStore
 from trading_mcp.sec_edgar import SecEdgarClient, SecEdgarError
 
 logger = logging.getLogger(__name__)
@@ -73,6 +74,10 @@ Regras de uso:
   O calendário é só dos EUA: eventos de outros países não aparecem. `leitura_da_fonte` é a interpretação da
   MetaQuotes, não um fato. Não atribua causa como certeza e não transforme a reação em compra ou venda.
 - `contexto_mercado` mostra os instrumentos operados lado a lado; correlação aparente não é causa.
+- Reações guardadas: rode `reacoes_registrar` antes de `reacoes_estatisticas` (e pelo menos uma vez por semana: o
+  calendário e o M1 do terminal só cobrem um período limitado). Se faltarem horários, rode de novo. Nas estatísticas,
+  cite o tamanho da amostra (`n`, `amostra_pequena`), os eventos no mesmo horário e `com_outro_evento_na_janela`;
+  não recalcule. Reação passada não é previsão: não transforme em compra ou venda.
 - Journal: rode `journal_sincronizar` antes de listar, anotar ou tirar estatísticas (importa do MT5 sem
   duplicar e sem apagar anotações). Use `journal_anotar` para setup, motivo, observações e o stop inicial
   quando faltar; reaproveite os nomes de `setups_existentes`. As estatísticas vêm prontas do servidor: não
@@ -82,7 +87,7 @@ Regras de uso:
 
 READ_ONLY = ToolAnnotations(read_only_hint=True, open_world_hint=True)
 JOURNAL_READ = ToolAnnotations(read_only_hint=True, open_world_hint=False)
-# Gravam só no journal local; nada é apagado.
+# Gravam só nos bancos locais (journal e reações); nada é apagado.
 JOURNAL_SYNC = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=True)
 JOURNAL_WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False)
 
@@ -94,7 +99,7 @@ def _tool_errors() -> Iterator[None]:
         yield
     except ToolError:
         raise
-    except (MT5Error, SecEdgarError, CalendarError, JournalError, ValueError) as exc:
+    except (MT5Error, SecEdgarError, CalendarError, JournalError, ReacoesError, ValueError) as exc:
         raise ToolError(str(exc)) from exc
     except Exception as exc:
         # Sem isto o modelo veria só "Error executing tool X", sem pista do que houve.
@@ -128,6 +133,7 @@ def create_server(
     sec_client: SecEdgarClient | None = None,
     calendar: EconomicCalendar | None = None,
     journal: Journal | None = None,
+    reactions: ReactionStore | None = None,
 ) -> MCPServer:
     settings = settings or load_settings()
     mt5 = mt5_client or MT5Client(settings)
@@ -136,6 +142,9 @@ def create_server(
         lambda: Path(mt5.terminal_data_path()) / "MQL5" / "Files" / "trading_mcp" / f"calendar_{CALENDAR_COUNTRY}.json"
     )
     journal = journal or Journal(settings.journal_path, settings.journal_export_dir, mt5, calendar)
+    reactions = reactions or ReactionStore(
+        settings.reacoes_path, mt5, calendar, settings.instruments, backup_dir=settings.journal_export_dir
+    )
 
     server = MCPServer(name="trading-mcp", instructions=INSTRUCTIONS, version="0.1.0")
 
@@ -480,6 +489,39 @@ def create_server(
         cotação de cada instrumento operado."""
         with _tool_errors():
             return reacao.context(mt5, simbolos or settings.instruments)
+
+    @server.tool(annotations=JOURNAL_SYNC)
+    def reacoes_registrar() -> dict[str, Any]:
+        """Guarda no banco local as divulgações dos EUA que o calendário cobre (fato publicado e surpresa) e mede a
+        reação de cada instrumento operado em +1/+5/+15/+60 min. Pode rodar sempre: não duplica; se faltar tempo,
+        rode de novo.
+        """
+        with _tool_errors():
+            return reactions.register()
+
+    @server.tool(annotations=JOURNAL_READ)
+    def reacoes_estatisticas(
+        evento: Annotated[
+            str, Field(description="Evento, ex.: claims, cpi, nfp ou o código; vazio = o que está guardado")
+        ] = "",
+        simbolos: Annotated[
+            list[str] | None, Field(description="Instrumentos; vazio = os operados (configurados no .env)")
+        ] = None,
+        janelas_min: Annotated[
+            list[int] | None, Field(description="Janelas guardadas: 1, 5, 15 e 60 minutos; padrão 5 e 15")
+        ] = None,
+        dias: Annotated[
+            float | None,
+            Field(gt=0, le=reacoes_module.MAX_STATS_DAYS, description="Só divulgações dos últimos N dias; vazio = todas"),
+        ] = None,
+    ) -> dict[str, Any]:
+        """Reações guardadas a um evento, agrupadas pela surpresa (acima, abaixo ou igual à previsão): tamanho da
+        amostra, variação mediana, quantas vezes subiu ou caiu e o movimento comparado ao típico, por instrumento.
+        """
+        with _tool_errors():
+            return reactions.stats(
+                evento, simbolos, janelas_min or reacoes_module.DEFAULT_STATS_WINDOWS, dias
+            )
 
     @server.tool(annotations=JOURNAL_SYNC)
     def journal_sincronizar(

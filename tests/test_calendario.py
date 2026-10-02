@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from trading_mcp.calendario import CalendarError, EconomicCalendar, measure
+from trading_mcp.calendario import CalendarError, EconomicCalendar, matches_search, measure
 
 UTC = timezone.utc
 NOW = datetime(2026, 10, 1, 12, 45, tzinfo=UTC)
@@ -497,3 +497,18 @@ def test_events_between_for_journal(tmp_path: Path) -> None:
     assert old is False  # antes dos 7 dias exportados
     with pytest.raises(ValueError):
         cal.events_between(NOW, NOW, "altissima")
+
+
+def test_coverage_follows_the_service_days(tmp_path: Path) -> None:
+    path = write(tmp_path, [], [], days_back=100, days_ahead=14)
+    first, last = cal(path).coverage()
+    generated = NOW - timedelta(seconds=10)
+    assert first == generated - timedelta(days=100) and last == generated + timedelta(days=14)
+
+
+def test_matches_search_uses_the_calendar_aliases() -> None:
+    assert matches_search("claims", "initial-jobless-claims", "Pedidos")
+    assert matches_search("nfp", "nonfarm-payrolls") and not matches_search("nfp", "adp-nonfarm-employment-change")
+    assert matches_search("cpi nucleo", "consumer-price-index-ex-food-energy-mm")
+    assert not matches_search("cpi nucleo", "consumer-price-index-mm")
+    assert matches_search("pedidos", "initial-jobless-claims", "Pedidos iniciais")

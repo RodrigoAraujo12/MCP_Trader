@@ -18,6 +18,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 # Fora do AppData (o Claude Desktop instalado pela Microsoft Store redireciona o AppData dos processos
 # que ele abre) e fora do OneDrive (sincronizar um SQLite aberto pode corrompê-lo).
 DEFAULT_JOURNAL_PATH = Path.home() / "trading-mcp" / "journal.sqlite3"
+DEFAULT_REACOES_PATH = Path.home() / "trading-mcp" / "reacoes.sqlite3"
 # Cópias e CSVs são arquivos fechados: dentro do projeto, o OneDrive os leva para a nuvem.
 DEFAULT_JOURNAL_EXPORT_DIR = PROJECT_ROOT / "journal_export"
 # Instrumentos operados pelo usuário: reação a eventos e contexto entre ativos usam esta lista.
@@ -102,6 +103,8 @@ class Settings:
     # Banco do journal (SQLite) e pasta das exportações/cópias de segurança.
     journal_path: Path = DEFAULT_JOURNAL_PATH
     journal_export_dir: Path = DEFAULT_JOURNAL_EXPORT_DIR
+    # Banco das reações a eventos guardadas (SQLite), no mesmo lugar do journal.
+    reacoes_path: Path = DEFAULT_REACOES_PATH
     instruments: tuple[str, ...] = DEFAULT_INSTRUMENTS
     # Arquivo .env efetivamente usado (None = nenhum encontrado).
     env_file: str | None = None
@@ -156,6 +159,7 @@ def load_settings(env_file: Path | None = None) -> Settings:
         sec_user_agent=_get(env, "SEC_USER_AGENT"),
         journal_path=_get_path(env, "JOURNAL_PATH", DEFAULT_JOURNAL_PATH),
         journal_export_dir=_get_path(env, "JOURNAL_EXPORT_DIR", DEFAULT_JOURNAL_EXPORT_DIR),
+        reacoes_path=_get_path(env, "REACOES_PATH", DEFAULT_REACOES_PATH),
         instruments=instruments,
         env_file=str(env_file) if env_file.is_file() else None,
         errors=tuple(errors),

@@ -116,9 +116,21 @@ def test_missing_bar_at_window_end_is_flagged():
 
 
 def test_no_data_before_event():
-    client, _ = _client(rates={"EURUSD": bars(EVENT, [1.1] * 10)})
+    # Histórico do dia anterior: o terminal tem dados, mas não houve negociação nas 2 h antes do evento.
+    old = bars(EVENT - timedelta(days=1), [1.1] * 10)
+    client, _ = _client(rates={"EURUSD": np.concatenate([old, bars(EVENT, [1.1] * 10)])})
     m = _measure(reacao.reaction(client, None, when="2026-09-30T11:30:00Z", symbols=["EURUSD"]), "EURUSD")
     assert m["referencia"] is None and any("fechado ou sem dados" in a for a in m["avisos"])
+    assert "fora_do_historico" not in m
+
+
+def test_event_before_terminal_history_is_not_called_market_closed():
+    # O M1 do terminal começa no horário do evento (limite de candles): não é mercado fechado.
+    client, _ = _client(rates={"EURUSD": bars(EVENT, [1.1] * 10)})
+    m = _measure(reacao.reaction(client, None, when="2026-09-30T11:30:00Z", symbols=["EURUSD"]), "EURUSD")
+    assert m["referencia"] is None and m["fora_do_historico"] is True
+    assert any("Fora do histórico M1" in a and "2026-09-30T11:30:00Z" in a for a in m["avisos"])
+    assert not any("fechado ou sem dados" in a for a in m["avisos"])
 
 
 def test_spread_from_ticks():

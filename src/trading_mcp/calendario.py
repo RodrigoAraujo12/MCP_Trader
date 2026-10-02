@@ -182,6 +182,20 @@ def _matches(tokens: list[str], ev: dict[str, Any]) -> bool:
     return True
 
 
+def matches_search(search: str, code: str, name: str | None = None) -> bool:
+    """A busca da tool ``calendario`` aplicada a um evento já conhecido (código e nome)."""
+    return _matches(_normalize(search).split(), {"event_code": code, "name": name})
+
+
+def _span(data: dict[str, Any]) -> tuple[datetime, datetime]:
+    """Intervalo que o arquivo cobre: da exportação - days_back até a exportação + days_ahead."""
+    generated = tempo.from_epoch(int(data["generated_gmt"]))
+    return (
+        generated - timedelta(days=int(data.get("days_back") or 0)),
+        generated + timedelta(days=int(data.get("days_ahead") or 0)),
+    )
+
+
 def _period_label(period_epoch: int, frequency: str | None) -> str:
     """Período de referência pela frequência (o MT5 guarda o primeiro dia do período)."""
     first_day = datetime.fromtimestamp(period_epoch, tz=timezone.utc)
@@ -355,9 +369,7 @@ class EconomicCalendar:
             raise ValueError(f"importancia_minima deve ser baixa, moderada ou alta (recebido: {min_importance!r}).")
         data = self._load()
         offset = round(int(data.get("server_gmt_offset_s") or 0) / _OFFSET_STEP_S) * _OFFSET_STEP_S
-        generated = tempo.from_epoch(int(data["generated_gmt"]))
-        first = generated - timedelta(days=int(data.get("days_back") or 0))
-        last = generated + timedelta(days=int(data.get("days_ahead") or 0))
+        first, last = _span(data)
         covered = first <= start and end <= last
         events = {ev["id"]: ev for ev in data.get("events", []) if isinstance(ev, dict) and "id" in ev}
         out: list[dict[str, Any]] = []
@@ -380,6 +392,10 @@ class EconomicCalendar:
                     }
                 )
         return sorted(out, key=lambda e: (e["utc"], e["codigo"])), covered
+
+    def coverage(self) -> tuple[datetime, datetime]:
+        """De quando até quando o arquivo traz eventos (dias para trás e para frente do serviço)."""
+        return _span(self._load())
 
     # ------------------------------------------------------------------ evento
     @staticmethod

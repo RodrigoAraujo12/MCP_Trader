@@ -334,6 +334,24 @@ def test_rates_respect_terminal_maxbars():
     assert len(client.rates("EURUSD", "M1", 100, include_current=False)) == 9
 
 
+def test_oldest_bar_is_the_first_of_what_the_terminal_keeps():
+    closes = [1.10 + i * 0.001 for i in range(20)]
+    fake = FakeMT5([make_symbol("EURUSD")], rates={"EURUSD": make_rates(closes, start_time=1_700_000_000)}, maxbars=10)
+    client, _ = make_client(fake)
+    # Com maxbars 10, o terminal entrega os 9 candles mais recentes: o mais antigo é o 12º (índice 11).
+    assert client.oldest_bar("EURUSD", "H1") == datetime.fromtimestamp(1_700_000_000 + 11 * 3600, tz=timezone.utc)
+
+
+def test_oldest_bar_retries_and_raises_instead_of_returning_nothing():
+    fake = FakeMT5([make_symbol("EURUSD")], rates={"EURUSD": make_rates([1.1] * 5)}, rates_fail_times=2)
+    client, _ = make_client(fake)
+    assert client.oldest_bar("EURUSD", "M1") is not None  # terceira tentativa
+    failing = FakeMT5([make_symbol("EURUSD")], rates={"EURUSD": make_rates([1.1] * 5)}, rates_fail_times=3)
+    client, _ = make_client(failing)
+    with pytest.raises(MT5Error, match="Sem candles"):
+        client.oldest_bar("EURUSD", "M1")
+
+
 def test_rates_invalid_timeframe():
     client, _ = rates_client()
     with pytest.raises(ValueError) as exc:

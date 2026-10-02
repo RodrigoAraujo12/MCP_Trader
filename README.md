@@ -58,6 +58,7 @@ Copy-Item .env.example .env
 | `JOURNAL_PATH` | Arquivo do journal (SQLite) | Não (padrão: `trading-mcp\journal.sqlite3` na pasta do seu usuário) |
 | `JOURNAL_EXPORT_DIR` | Pasta das cópias de segurança e CSVs do journal | Não (padrão: `journal_export` no projeto) |
 | `INSTRUMENTOS` | Instrumentos operados, separados por vírgula (reação a eventos e contexto entre ativos) | Não (padrão: `USTEC,US30,JP225,XAUUSD,GBPUSD,EURUSD,BTCUSD,UKOIL,DXY`) |
+| `REACOES_PATH` | Banco das reações guardadas (SQLite) | Não (padrão: `trading-mcp\reacoes.sqlite3` na pasta do seu usuário) |
 
 O `.env` é lido da pasta raiz do projeto, mesmo que o servidor seja iniciado de outro lugar (`TRADING_MCP_ENV_FILE` aponta para outro arquivo, se preferir). Arquivos salvos pelo Bloco de Notas (com BOM ou UTF-16) funcionam. O `.env` está no `.gitignore` e nunca deve ir para o git.
 
@@ -87,6 +88,8 @@ Use uma instalação **separada** do MT5, logada **só** na conta demo, e aponte
 | `fundamentos` | Fundamentos da SEC EDGAR (receita, lucro, LPA, ROE, margem) | `ticker` (ex.: AAPL, MSFT, BRK.B) |
 | `reacao_evento` | Fato publicado (realizado, previsão, surpresa) e, separado, o movimento de cada instrumento depois do evento | `evento` (ex.: CPI, NFP, claims) ou `horario_utc`, `simbolos` (padrão: `INSTRUMENTOS`), `janelas_min` (padrão 1, 5, 15) |
 | `contexto_mercado` | Instrumentos lado a lado: variação em 15 min, 1 h, 4 h e no dia, faixa do dia e estado da cotação | `simbolos` (padrão: `INSTRUMENTOS`) |
+| `reacoes_registrar` | Guarda as divulgações dos EUA que o calendário cobre e a reação medida de cada instrumento (não duplica; se faltar tempo, rode de novo) | — |
+| `reacoes_estatisticas` | Reações guardadas a um evento, agrupadas pela surpresa (acima, abaixo ou igual à previsão), com o tamanho da amostra | `evento` (vazio = o que está guardado), `simbolos`, `janelas_min` (1, 5, 15, 60; padrão 5 e 15), `dias` |
 | `journal_sincronizar` | Importa as operações da conta do histórico do MT5 para o journal (não duplica, não apaga anotações) | `dias` (padrão 7) |
 | `journal_anotar` | Anota uma operação: setup, tags, motivo, observação, stop inicial, notícia | `operacao_id` ou `ticket`, e os campos a gravar |
 | `journal_listar` | Operações com resultado, R, stop inicial, notícia e anotações | `dias` (padrão 30), `simbolo`, `setup`, `status`, `limite` |
@@ -113,17 +116,33 @@ Use uma instalação **separada** do MT5, logada **só** na conta demo, e aponte
 - **Busca**: `evento` pega o dia mais recente com divulgação e, nele, o evento de maior importância mais cedo (em dia de FOMC, a decisão das 18:00, não a entrevista); os demais aparecem em `outros_candidatos`.
 - **Avisos de dados**: referência antiga (mercado parado antes do evento), sem negociação depois (mercado fechado), candle faltando no fim da janela, janelas que ainda não terminaram (`pendente`).
 - **Compare pela variação em %**: um ponto de USTEC, de ouro e de EURUSD não têm o mesmo peso. Pips só aparecem em pares de moedas (EURUSD, GBPUSD).
-- **Alcance**: os candles M1 vão até cerca de 3 meses para trás; o arquivo do calendário cobre 7 dias. Para eventos mais antigos, informe `horario_utc` (o movimento é medido, mas sem o fato publicado).
+- **Alcance**: os candles M1 vão até cerca de 3 meses para trás (menos no BTCUSD, que negocia 24 h). A busca por nome olha os últimos 7 dias; para eventos mais antigos, informe `horario_utc` (o fato publicado só aparece se o arquivo do calendário cobrir a data: veja `InpDaysBack`).
 - **Sem yields**: a conta não tem instrumento de Treasury; rendimentos não estão disponíveis. `DXYm` é um CFD da corretora e `JP225m` é cotado em ienes.
 
 `contexto_mercado` mostra os instrumentos operados lado a lado (variação em 15 min, 1 h, 4 h e desde o último preço antes de 00:00 UTC, e onde o preço está na faixa do dia). `desde` marca quando o preço de partida é mais antigo, porque o mercado estava fechado (o UKOIL, por exemplo, para às 21:00 UTC). Serve para ver, por exemplo, o dólar subindo junto com a queda do ouro e dos índices. Correlação aparente não indica causa.
+
+## Reações guardadas
+
+O calendário do terminal cobre poucos dias para trás e o M1, cerca de 3 meses: o que não for guardado se perde. `reacoes_registrar` guarda num banco local cada divulgação dos EUA de importância moderada ou alta com horário exato (o fato: realizado, previsão, surpresa) e, separado, o movimento de cada instrumento operado em +1, +5, +15 e +60 min, medido do mesmo jeito que `reacao_evento` (os números batem). `reacoes_estatisticas` agrupa as divulgações de um evento pelo sentido da surpresa.
+
+- **Rotina**: rode `reacoes_registrar` a cada 5 ou 6 dias (com `InpDaysBack` = 7) ou a cada poucas semanas (com 100). Cada chamada guarda tudo o que o arquivo do calendário cobre e avisa se houve **lacuna** desde a anterior. Pode rodar sempre: não duplica, e uma divulgação que estava sem realizado ganha o valor quando ele aparece. Mede do horário mais antigo para o mais novo e para em cerca de 40 s (o Claude Desktop desiste de uma ferramenta em cerca de 60 s); se faltar, avisa para rodar de novo.
+- **Primeira carga**: para guardar os ~3 meses que o terminal ainda tem, mude `InpDaysBack` do serviço para 100 (veja a seção do calendário) e rode `reacoes_registrar` até não faltar nada e, 10 min depois, mais uma vez para confirmar as medições com falha.
+- **Medições a confirmar**: uma medição com falha (sem negociação antes ou depois do evento, referência antiga, preço antigo no fim da janela, candles faltando) pode ser só histórico que o terminal ainda não baixou. Ela fica `a_confirmar`, é refeita nos registros seguintes e só entra nas estatísticas quando duas medições com pelo menos 10 min de distância dão o mesmo resultado; se o horário sair do histórico M1 antes disso, fica `nao_confirmavel`. Com o terminal sem conexão, nada é medido.
+- **Histórico M1 por símbolo**: o terminal guarda um número fixo de candles, então símbolos que negociam 24 h (BTCUSD) cobrem menos dias. Divulgações anteriores ao início do M1 de um símbolo ficam sem medição para ele (`fora_do_historico_m1` diz desde quando há M1).
+- **Estatísticas**: por instrumento e janela, `todas` traz o tamanho da amostra (`n`), a mediana do movimento absoluto em % e de `vezes_o_tipico` e quantas foram reação clara (3× o típico ou mais); `surpresa_acima`, `surpresa_abaixo` e `igual_a_previsao` trazem a mediana da variação em % e quantas vezes subiu ou caiu. `ultimas_divulgacoes` lista as mais recentes com o movimento de cada instrumento.
+- **Fora das contas** (`fora_das_contas`), por motivo: `sem_medicao` (fora do histórico M1 ou ainda não medida), `sem_referencia` (sem negociação nas 2 h antes), `referencia_antiga` (mercado parado antes do evento), `sem_negociacao` (nada depois do evento), `preco_antigo` (o último preço da janela é de mais de 5 min antes do fim dela), `a_confirmar` e `nao_confirmavel`.
+- **Misturas**: eventos no mesmo horário dividem a mesma reação (payroll, desemprego e salários saem juntos): veja `no_mesmo_horario`. `com_outro_evento_na_janela` conta divulgações com outro evento moderado ou alto dentro da janela. O calendário é só dos EUA.
+- **Amostra pequena**: menos de 20 divulgações = `amostra_pequena`. Em 3 meses, um evento semanal (claims) chega a ~13 divulgações e um mensal (CPI, payroll) a ~3; a amostra cresce conforme você guarda.
+- **Fatos guardados depois**: a divulgação guarda a previsão como o calendário a mostrava no registro; `registradas_depois_do_dia` conta as guardadas mais de 24 h depois da divulgação (na primeira carga, quase todas).
+- **Onde fica**: `trading-mcp\reacoes.sqlite3` na pasta do seu usuário, ao lado do journal (`REACOES_PATH` muda o local). Cada registro que muda algo grava uma cópia em `journal_export\reacoes-copia.sqlite3`, dentro do projeto (vai para o OneDrive): medições com mais de ~3 meses não podem ser refeitas.
+- **Estimativas**: em eventos com primeira estimativa e revisões do mesmo período (PIB), `estimativas` conta cada tipo; as estatísticas juntam os dois.
 
 ## Journal
 
 O journal registra as operações da conta demo para medir o que funciona. **O MT5 é a fonte dos fatos**: cada posição vira uma operação, com entrada e saída pelo preço médio dos negócios executados, volume, comissão, swap, resultado líquido, horários e motivo do fechamento (stop, alvo, manual). Você só acrescenta, pelo chat, o que o MT5 não sabe: setup, tags, motivo da entrada e observações.
 
 - **Stop inicial e R**: o stop inicial vem da ordem que abriu a posição (quando o stop foi definido na boleta). Se você só colocou o stop depois, o journal usa o stop visto com a posição aberta na primeira sincronização (marcado como `observado`, porque pode já ter sido movido), ou o que você informar com `journal_anotar`. Risco inicial = perda até esse stop; R = resultado líquido / risco inicial.
-- **Notícia**: a operação é marcada `sim` quando houve evento dos EUA de importância alta entre 30 min antes da entrada e o fechamento, pelo calendário do MT5. O arquivo do calendário cobre só os últimos 7 dias: sincronize pelo menos uma vez por semana, senão a marcação fica `desconhecido`. Você pode corrigir com `journal_anotar`.
+- **Notícia**: a operação é marcada `sim` quando houve evento dos EUA de importância alta entre 30 min antes da entrada e o fechamento, pelo calendário do MT5. O arquivo do calendário cobre só os dias de `InpDaysBack` do serviço (padrão 7): sincronize dentro desse prazo, senão a marcação fica `desconhecido`. Você pode corrigir com `journal_anotar`.
 - **Estatísticas**: só operações fechadas; cada grupo mostra o tamanho da amostra e quantas operações ficaram sem R. Calculadas no servidor, sempre do mesmo jeito.
 - **Onde fica**: o banco fica em `trading-mcp\journal.sqlite3` na pasta do seu usuário, fora do OneDrive (sincronizar um banco aberto pode corrompê-lo) e fora do AppData (o Claude Desktop da Microsoft Store redireciona o AppData dos programas que ele abre). `journal_exportar` grava uma cópia do banco e um CSV (separador `;`, vírgula decimal, abre direto no Excel) em `journal_export`, dentro do projeto: como o projeto está no OneDrive, as cópias vão para a nuvem.
 
@@ -138,6 +157,7 @@ O journal registra as operações da conta demo para medir o que funciona. **O M
 - "Como estão minhas estatísticas por setup? E com notícia e sem notícia?"
 - "O Claims veio acima da previsão. Como reagiram USTEC, US30, ouro, DXY e as moedas nos primeiros 15 minutos?"
 - "Me dá o contexto entre ativos agora: dólar, ouro, índices, petróleo e BTC."
+- "Guarda as reações da semana. Como USTEC e ouro costumam reagir ao Claims acima e abaixo da previsão? Qual o tamanho da amostra?"
 - "Quantos lotes devo usar para arriscar 1% com entrada 1.0850 e stop 1.0820 no EURUSD?"
 - "Mostre os fundamentos da AAPL: receita, lucro, margem e ROE do último ano."
 - "Qual foi a variação percentual do XAUUSD nos últimos 50 candles em D1?"
@@ -154,7 +174,7 @@ Instalação (uma vez):
 2. Compile: abra no MetaEditor (F4 no terminal) e pressione F7, ou pela linha de comando: `MetaEditor64.exe /compile:"<pasta de dados>\MQL5\Services\TradingMcpCalendar.mq5" /log`.
 3. No terminal, **Navegador (Ctrl+N) → Serviços → TradingMcpCalendar → botão direito → Adicionar serviço → OK**. A aba Diário mostra `TradingMcpCalendar: exportando US...`.
 
-O serviço confere mudanças a cada 15 s e regrava tudo a cada 5 min. Ele volta sozinho quando o terminal reabre, se estava rodando ao fechar. Se o arquivo parar de ser atualizado, a ferramenta avisa (`estado = "desatualizado"`).
+O serviço confere mudanças a cada 15 s e regrava tudo a cada 5 min. `InpDaysBack` (padrão 7) define quantos dias para trás vão no arquivo: para guardar reações (`reacoes_registrar`) e para o journal marcar notícias em operações antigas, use 100 (botão direito no serviço → **Propriedades → Parâmetros de entrada**; não precisa recompilar). Ele volta sozinho quando o terminal reabre, se estava rodando ao fechar. Se o arquivo parar de ser atualizado, a ferramenta avisa (`estado = "desatualizado"`).
 
 Como ler os dados:
 
@@ -221,6 +241,7 @@ src/trading_mcp/
 ├── posicoes.py        # Relatório de posições e ordens pendentes
 ├── journal.py         # Journal de operações em SQLite (importado do histórico do MT5)
 ├── reacao.py          # Reação a eventos e contexto entre ativos
+├── reacoes.py         # Reações guardadas (SQLite) e estatísticas por tipo de surpresa
 ├── indicators.py      # Indicadores técnicos
 ├── risk.py            # Tamanho de posição e arredondamento de lote
 └── sec_edgar.py       # Fundamentos da SEC EDGAR
@@ -260,7 +281,7 @@ Revisado em 2026-10-01. Tudo continua somente leitura até a etapa F.
 
 - **A** (feito): base validada no MT5 real (identidade da conta, horários em UTC, estado da cotação).
 - **B** (feito): calendário econômico (B2), consulta de posições com distâncias e risco até o stop (B1) e journal em SQLite importado do MT5 (B3).
-- **C**: reação observada a eventos e contexto entre ativos para os instrumentos operados (feito: C1). Próximos: guardar as reações para estatísticas por tipo de surpresa (o calendário só cobre 7 dias), e notícias só depois de medir a latência das fontes gratuitas.
+- **C**: reação observada a eventos e contexto entre ativos para os instrumentos operados (C1) e reações guardadas para estatísticas por tipo de surpresa (C2), ambas feitas. Próximo: notícias, só depois de medir a latência das fontes gratuitas.
 - **D**: backtest de um único setup definido por regras objetivas.
 - **E**: propostas de operação com limites rígidos e aprovação humana fora do chat, ainda sem envio.
 - **F**: execução **somente em conta demo**, com verificação de conta imediatamente antes do envio, reconciliação e kill switch.

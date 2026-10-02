@@ -108,6 +108,13 @@ Os índices da Exness vêm com moeda base e de lucro = USD (por isso "pips" só 
 - `contexto_mercado` às 04:40 UTC: o UKOIL não negocia na virada do dia (último preço às 21:00 UTC, primeiro candle às 00:10), por isso a variação do dia parte do preço das 21:00 e vem marcada com `desde`.
 - Spread na conta demo: praticamente fixo na divulgação (USTEC 112 pontos antes e depois; JP225 31 → 34; ouro 240 → 260; UKOIL 44 → 42). A conta real pode se comportar diferente.
 
+## Reações guardadas (etapa C2, 2026-10-02 ~10:00 UTC)
+
+- Início do M1 que o terminal entrega (`copy_rates_from_pos` com 99.999 candles, limite de 100.000 do terminal): UKOIL 11/06 09:26, JP225 22/06 20:26, US30 23/06 11:37, XAUUSD 23/06 13:08, USTEC 23/06 13:14, EURUSD 25/06 07:45, GBPUSD 25/06 22:24, DXY 26/06 08:13, **BTCUSD 24/07 22:34** (negocia 24 h, então 100 mil candles cobrem menos dias). Todos em UTC.
+- `copy_rates_range` pedindo 100 dias de M1 de uma vez falha com "Invalid params" (passa do limite de candles): a medição é feita evento a evento (3 h de M1 + ticks de 7 min por instrumento).
+- Tempo: com o histórico já carregado no terminal, cada chamada leva milissegundos e um horário de divulgação com os 9 instrumentos leva ~0,3–0,5 s. A primeira leitura de um período antigo leva alguns segundos (o terminal baixa o histórico). Com o calendário de 7 dias: 48 divulgações, 22 horários, 198 medições em ~10 s.
+- Os números guardados batem com `reacao_evento` no mesmo horário (Claims de 1/10, 12:30 UTC: USTEC −0,008/+0,025/−0,038% e ouro +0,044/+0,102/+0,066% em 1/5/15 min).
+
 ## Ainda não reproduzido no terminal real
 
 - Troca de conta e perda de conexão com o servidor em execução. Estão cobertas por testes com MT5 simulado.

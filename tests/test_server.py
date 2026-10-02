@@ -29,9 +29,10 @@ from trading_mcp.server import create_server
 EXPECTED_TOOLS = {
     "cotacao", "historico", "indicadores", "tamanho_posicao", "info_conta", "posicoes", "simbolos", "calendario",
     "fundamentos", "reacao_evento", "contexto_mercado", "journal_sincronizar", "journal_anotar", "journal_listar", "journal_estatisticas", "journal_exportar",
+    "reacoes_registrar", "reacoes_estatisticas",
 }
-# Gravam só no arquivo local do journal; todas as demais são somente leitura.
-JOURNAL_WRITERS = {"journal_sincronizar", "journal_anotar", "journal_exportar"}
+# Gravam só nos bancos locais (journal e reações); todas as demais são somente leitura.
+JOURNAL_WRITERS = {"journal_sincronizar", "journal_anotar", "journal_exportar", "reacoes_registrar"}
 
 
 @pytest.fixture
@@ -102,6 +103,7 @@ def _server(fake: FakeMT5 | None = None, sec: Any | None = None, calendar: Any |
     scratch = Path(tempfile.mkdtemp(prefix="journal-test-"))
     settings_kwargs.setdefault("journal_path", scratch / "journal.sqlite3")
     settings_kwargs.setdefault("journal_export_dir", scratch / "export")
+    settings_kwargs.setdefault("reacoes_path", scratch / "reacoes.sqlite3")
     settings = Settings(max_bars=5_000, **settings_kwargs)
     mt5 = MT5Client(settings, mt5_module=fake or _fake_mt5())
     return create_server(settings, mt5, sec or FakeSec(), calendar)
@@ -157,6 +159,19 @@ async def test_reacao_and_contexto_use_configured_instruments() -> None:
     assert eur["janelas"][0]["pips"] == 5.0
     assert [i["simbolo"] for i in context["instrumentos"]] == ["EURUSDm", "USDJPYm"]
     assert "Informe o evento" in _error_text(nothing)
+
+
+@pytest.mark.anyio
+async def test_reacoes_tools_report_errors_to_the_model(tmp_path: Any) -> None:
+    db = tmp_path / "reacoes.sqlite3"
+    async with Client(_server(reacoes_path=db)) as client:
+        empty = await client.call_tool("reacoes_estatisticas", {"evento": "claims"})
+        windows = await client.call_tool("reacoes_estatisticas", {"evento": "claims", "janelas_min": [30]})
+        # Sem o arquivo do calendário no terminal falso: o erro aponta o serviço do MT5.
+        no_calendar = await client.call_tool("reacoes_registrar", {})
+    assert "reacoes_registrar" in _error_text(empty) and not db.exists()
+    assert "Janelas guardadas" in _error_text(windows)
+    assert "TradingMcpCalendar" in _error_text(no_calendar)
 
 
 @pytest.mark.anyio
@@ -524,6 +539,7 @@ async def test_stdio_server_starts_from_other_cwd(tmp_path: Any) -> None:
         "TRADING_MCP_ENV_FILE": str(tmp_path / "nenhum.env"),
         "JOURNAL_PATH": str(tmp_path / "journal.sqlite3"),
         "JOURNAL_EXPORT_DIR": str(tmp_path / "exp"),
+        "REACOES_PATH": str(tmp_path / "reacoes.sqlite3"),
     }
     params = StdioServerParameters(command=sys.executable, args=["-m", "trading_mcp"], env=env, cwd=str(tmp_path))
     async with Client(params) as client:

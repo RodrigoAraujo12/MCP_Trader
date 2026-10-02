@@ -684,6 +684,31 @@ class MT5Client:
         return df.reset_index(drop=True)
 
     @_guard
+    def oldest_bar(self, symbol: str, timeframe: str) -> datetime:
+        """Abertura do candle mais antigo que o terminal entrega.
+
+        O terminal guarda um número fixo de candles ("Máx. de barras no gráfico"): no M1, um símbolo que
+        negocia 24 h por dia (BTCUSD) tem menos dias de histórico que um índice com pausa diária. Falha de
+        leitura vira MT5Error, nunca "sem histórico".
+        """
+        tf_key = (timeframe or "").strip().upper()
+        if tf_key not in TIMEFRAMES:
+            raise ValueError(f"Timeframe inválido: '{timeframe}'. Válidos: {', '.join(TIMEFRAMES)}.")
+        with self._lock:
+            resolved = self.resolve_symbol(symbol)
+            count = self._terminal_maxbars - 1 if self._terminal_maxbars else 99_999
+            tf = getattr(self._module(), TIMEFRAMES[tf_key])
+            for attempt in range(_RATES_ATTEMPTS):
+                if attempt:
+                    self._sleep(_RATES_RETRY_S)
+                data = self._call("copy_rates_from_pos", resolved, tf, 0, count)
+                if data is not None and len(data) > 0:
+                    break
+            else:
+                raise MT5Error(f"Sem candles para {resolved} em {tf_key}: {self._last_error()}")
+        return tempo.from_epoch(int(data["time"][0]))
+
+    @_guard
     def ticks_between(self, symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
         """Mudanças de bid/ask entre ``start`` e ``end`` (UTC), com ``time`` em milissegundos convertido para UTC."""
         start, end = self._require_utc(start, end)

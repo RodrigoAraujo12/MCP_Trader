@@ -21,11 +21,11 @@ DEFAULT_WINDOWS = (1, 5, 15)
 MAX_WINDOW_MIN = 240
 MAX_SYMBOLS = 20
 # Candles M1 antes do evento: referência e movimento típico (base de comparação entre instrumentos).
-_LOOKBACK_MIN = 120
+LOOKBACK_MIN = 120
 _TYPICAL_MAX_WINDOW = 30
 _TYPICAL_MIN_SAMPLES = 20
 # Último preço mais velho que isso = mercado parado (fechado ou sem liquidez) naquele instante.
-_STALE_MIN = 5
+STALE_MIN = 5
 _SPREAD_BEFORE = timedelta(minutes=5)
 _SPREAD_AFTER = timedelta(minutes=2)
 # Eventos a partir desta importância liberados dentro da janela de medição são listados.
@@ -132,20 +132,36 @@ def _spread(mt5: MT5Client, symbol: str, moment: datetime, now: datetime, point:
     }
 
 
-def _measure(mt5: MT5Client, name: str, moment: datetime, windows: Sequence[int], now: datetime) -> dict[str, Any]:
+def _history_start(mt5: MT5Client, symbol: str) -> datetime | None:
+    try:
+        return mt5.oldest_bar(symbol, "M1")
+    except MT5Error:
+        return None
+
+
+def measure(mt5: MT5Client, name: str, moment: datetime, windows: Sequence[int], now: datetime) -> dict[str, Any]:
+    """Movimento de um instrumento depois de ``moment``: referência, janelas, extremos e spread."""
     spec = mt5.symbol_spec(name)
     symbol, digits = spec["simbolo"], spec["digitos"]
     last = max(windows)
     end = min(moment + timedelta(minutes=last), now)
-    df = mt5.rates_between(symbol, "M1", moment - timedelta(minutes=_LOOKBACK_MIN), end)
+    df = mt5.rates_between(symbol, "M1", moment - timedelta(minutes=LOOKBACK_MIN), end)
     out: dict[str, Any] = {"simbolo": symbol, "descricao": spec["descricao"]}
     warnings: list[str] = []
     if not df.attrs.get("conectado", True):
+        out["sem_conexao"] = True
         warnings.append("Terminal sem conexão com a corretora: candles recentes podem faltar.")
     ref = _close_by(df, moment)
     if ref is None:
         out["referencia"] = None
-        if df.empty:
+        oldest = _history_start(mt5, symbol)
+        if oldest is not None and oldest > moment - timedelta(minutes=LOOKBACK_MIN):
+            out["fora_do_historico"] = True
+            warnings.append(
+                f"Fora do histórico M1 do terminal: {symbol} tem candles desde {tempo.iso_utc(oldest)} (o terminal "
+                "guarda um número fixo de candles; símbolos que negociam 24 h, como BTCUSD, cobrem menos dias)."
+            )
+        elif df.empty and oldest is None:
             warnings.append(
                 "Sem candles M1 nesse período: fora do histórico disponível (cerca de 3 meses), mercado fechado ou "
                 "sem dados."
@@ -156,7 +172,7 @@ def _measure(mt5: MT5Client, name: str, moment: datetime, windows: Sequence[int]
         return out
     ref_price, ref_time = ref
     out["referencia"] = {"preco": round(ref_price, digits), "ate": tempo.iso_utc(ref_time)}
-    if moment - ref_time > timedelta(minutes=_STALE_MIN):
+    if moment - ref_time > timedelta(minutes=STALE_MIN):
         out["referencia"]["antiga"] = True
         warnings.append(
             f"O último preço antes do evento é de {tempo.describe_age((moment - ref_time).total_seconds())} antes: "
@@ -306,8 +322,8 @@ def _calendar_part(
         notes.append(f"Nenhum evento '{search}' nesse horário. Eventos dos EUA nesse horário: {listed_now}.")
     elif not rows:
         notes.append(
-            "Nenhum evento do calendário dos EUA nesse horário (o arquivo cobre só os últimos 7 dias): confira o "
-            "horário."
+            "Nenhum evento do calendário dos EUA nesse horário (o arquivo cobre só os dias para trás definidos no "
+            "serviço, InpDaysBack): confira o horário."
         )
     if info.get("estado") != "atual":
         notes.append(
@@ -343,7 +359,7 @@ def reaction(
     measures = []
     for name in symbols:
         try:
-            measures.append(_measure(mt5, name, moment, windows, now))
+            measures.append(measure(mt5, name, moment, windows, now))
         except (MT5Error, ValueError) as exc:
             measures.append({"simbolo": name, "erro": str(exc)})
     return {
@@ -380,7 +396,7 @@ def context(mt5: MT5Client, symbols: Sequence[str]) -> dict[str, Any]:
             spec = mt5.symbol_spec(name)
             symbol, digits = spec["simbolo"], spec["digitos"]
             quote = mt5.quote(symbol)
-            start = min(now - timedelta(minutes=longest + _LOOKBACK_MIN), day_start)
+            start = min(now - timedelta(minutes=longest + LOOKBACK_MIN), day_start)
             df = mt5.rates_between(symbol, "M1", start, now)
             baseline = _day_baseline(mt5, symbol, day_start)
         except (MT5Error, ValueError) as exc:
@@ -400,12 +416,12 @@ def context(mt5: MT5Client, symbols: Sequence[str]) -> dict[str, Any]:
                 changes[label] = None
                 continue
             entry = _move(current, past[0], spec)
-            if window_start - past[1] > timedelta(minutes=_STALE_MIN):
+            if window_start - past[1] > timedelta(minutes=STALE_MIN):
                 entry["desde"] = tempo.iso_utc(past[1])  # mercado parado no início da janela
             changes[label] = entry
         if baseline is not None:
             entry = _move(current, baseline[0], spec)
-            if day_start - baseline[1] > timedelta(minutes=_STALE_MIN):
+            if day_start - baseline[1] > timedelta(minutes=STALE_MIN):
                 entry["desde"] = tempo.iso_utc(baseline[1])  # o mercado fechou antes da virada do dia
             changes["dia_utc"] = entry
         else:
@@ -419,7 +435,7 @@ def context(mt5: MT5Client, symbols: Sequence[str]) -> dict[str, Any]:
                 "posicao_pct": round((current - low) / (high - low) * 100, 1) if high > low else None,
             }
             first = today["time"].iloc[0].to_pydatetime()
-            if first - day_start > timedelta(minutes=_STALE_MIN):
+            if first - day_start > timedelta(minutes=STALE_MIN):
                 day_range["desde"] = tempo.iso_utc(first)  # primeiro negócio do dia depois de 00:00
             item["faixa_do_dia"] = day_range
         item["variacao"] = changes
