@@ -4,6 +4,9 @@ O MT5 é a fonte dos fatos de execução (negócios, preços, custos e horários
 que só o usuário sabe (setup, motivo, observações) e o stop inicial, que define o risco inicial e
 o resultado em R. Uma operação é uma posição do MT5; cada execução dela é um negócio. Estatísticas
 são calculadas aqui, de forma determinística.
+
+Banco: o esquema é preparado numa transação própria; gravações usam BEGIN IMMEDIATE (a trava de
+escrita vale desde a leitura); o trabalho no MT5 e no calendário é feito antes de abrir a transação.
 """
 
 from __future__ import annotations
@@ -22,14 +25,17 @@ from trading_mcp import tempo
 from trading_mcp.calendario import CalendarError, EconomicCalendar
 from trading_mcp.mt5_client import MT5Client, MT5Error
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 # Operação "com notícia": evento dos EUA de importância alta de 30 min antes da entrada até o fechamento.
 NEWS_BEFORE = timedelta(minutes=30)
 NEWS_IMPORTANCE = "alta"
 # Grupos com menos operações que isto são marcados como amostra pequena.
 SMALL_SAMPLE = 20
 _VOLUME_EPS = 1e-6
-_MANUAL = ("terminal", "celular", "web")
+# Negócios de serviço (rolagem, desdobramento) não são entradas nem saídas da operação.
+_SERVICE_REASONS = ("rolagem", "desdobramento")
+_STOP_SOURCES = ("ordem_de_abertura", "informado", "observado")
+_EMPTY = "O journal ainda está vazio: rode `journal_sincronizar` para importar as operações do MT5."
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (chave TEXT PRIMARY KEY, valor TEXT NOT NULL);
@@ -64,6 +70,7 @@ CREATE TABLE IF NOT EXISTS operacoes (
     noticia TEXT NOT NULL DEFAULT 'desconhecido',
     noticia_fonte TEXT,
     noticias TEXT,
+    noticia_ate_utc TEXT,
     setup TEXT,
     tags TEXT,
     motivo TEXT,
@@ -92,11 +99,13 @@ CREATE TABLE IF NOT EXISTS negocios (
     PRIMARY KEY (conta_login, conta_servidor, ticket)
 );
 """
+# Colunas acrescentadas depois da versão 1 (migração com ALTER TABLE).
+_ADDED_COLUMNS = {"noticia_ate_utc": "TEXT"}
 
 _STATS_NOTES = [
     "Só operações fechadas entram nas estatísticas.",
     "Taxa de acerto = ganhos / operações (empates contam no total). Resultado líquido = preço + comissão + "
-    "swap + taxas.",
+    "swap + taxas. fator_lucro nulo = nenhuma perda no grupo.",
     "R = resultado líquido / risco inicial (perda até o stop inicial). Sem stop inicial conhecido, a operação "
     "fica fora das médias em R.",
     "Notícia = evento dos EUA de importância alta entre 30 min antes da entrada e o fechamento, pelo calendário "
@@ -135,19 +144,20 @@ def _weighted(deals: list[dict]) -> tuple[float, float | None]:
 
 
 def _summarize(deals: list[dict]) -> dict[str, Any]:
-    """Fatos de uma posição a partir dos negócios dela (do mais antigo ao mais novo)."""
-    ins = [d for d in deals if d["entrada"] in ("in", "inout")]
-    outs = [d for d in deals if d["entrada"] in ("out", "out_by", "inout")]
-    first = ins[0] if ins else deals[0]
+    """Fatos de uma posição a partir dos negócios dela (do mais antigo ao mais novo; há ao menos uma entrada)."""
+    trading = [d for d in deals if d["motivo"] not in _SERVICE_REASONS]
+    ins = [d for d in trading if d["entrada"] in ("in", "inout")]
+    outs = [d for d in trading if d["entrada"] in ("out", "out_by", "inout")]
+    first = ins[0]
     vol_in, price_in = _weighted(ins)
     vol_out, price_out = _weighted(outs)
-    remaining = vol_in - vol_out
-    if remaining <= _VOLUME_EPS and vol_in > 0:
+    if vol_in - vol_out <= _VOLUME_EPS:
         status = "fechada"
     elif vol_out > _VOLUME_EPS:
         status = "parcial"
     else:
         status = "aberta"
+    # Valores em dinheiro de todos os negócios, inclusive os de serviço.
     gross = sum(d["lucro"] for d in deals)
     commission = sum(d["comissao"] for d in deals)
     swap = sum(d["swap"] for d in deals)
@@ -188,7 +198,8 @@ def _stats(rows: list[dict]) -> dict[str, Any]:
     nets = [round(r["resultado_liquido"], 2) for r in rows]
     wins = [x for x in nets if x > 0]
     losses = [x for x in nets if x < 0]
-    rs = [r["r"] for r in rows if r["r"] is not None]
+    with_r = [r for r in rows if r["r"] is not None]
+    rs = [r["r"] for r in with_r]
     return {
         "operacoes": n,
         "ganhos": len(wins),
@@ -207,6 +218,12 @@ def _stats(rows: list[dict]) -> dict[str, Any]:
             "sem_risco_inicial": n - len(rs),
             "r_total": round(sum(rs), 2) if rs else None,
             "r_medio": round(mean(rs), 2) if rs else None,
+            # De onde veio o stop inicial: "observado" pode ser um stop já movido.
+            "por_fonte_do_stop": {
+                src: sum(1 for r in with_r if r["stop_inicial_fonte"] == src)
+                for src in _STOP_SOURCES
+                if any(r["stop_inicial_fonte"] == src for r in with_r)
+            },
         },
         "custos": {
             "comissao": round(sum(r["comissao"] for r in rows), 2),
@@ -238,6 +255,18 @@ def _group(rows: list[dict], key: Callable[[dict], str]) -> list[dict[str, Any]]
     return sorted(out, key=lambda g: (-g["operacoes"], g["grupo"]))
 
 
+def _filters(symbol: str, setup: str) -> tuple[list[str], list[Any]]:
+    where: list[str] = []
+    params: list[Any] = []
+    if symbol.strip():
+        where.append("UPPER(simbolo) LIKE ?")
+        params.append(f"{symbol.strip().upper()}%")
+    if setup.strip():
+        where.append("LOWER(setup) = ?")
+        params.append(setup.strip().lower())
+    return where, params
+
+
 class Journal:
     """Journal em SQLite; cada chamada abre e fecha a própria conexão."""
 
@@ -256,26 +285,54 @@ class Journal:
         self._now = now_utc or mt5.now_utc
 
     # ------------------------------------------------------------------ banco
+    def _prepare(self, conn: sqlite3.Connection, write: bool) -> None:
+        """Confere a versão antes de tudo; só quem grava cria ou migra o esquema (em autocommit)."""
+        has_meta = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'").fetchone()
+        stored = None
+        if has_meta:
+            row = conn.execute("SELECT valor FROM meta WHERE chave = 'schema'").fetchone()
+            stored = int(row["valor"]) if row else None
+            if stored is not None and stored > SCHEMA_VERSION:
+                raise JournalError(
+                    f"O journal ({self._path}) foi criado por uma versão mais nova do servidor "
+                    f"(schema {stored}); atualize o trading-mcp."
+                )
+        if not write:
+            if not has_meta:
+                raise JournalError(_EMPTY)
+            return
+        conn.executescript(_SCHEMA)
+        columns = {r["name"] for r in conn.execute("PRAGMA table_info(operacoes)")}
+        for name, kind in _ADDED_COLUMNS.items():
+            if name not in columns:
+                conn.execute(f"ALTER TABLE operacoes ADD COLUMN {name} {kind}")
+        if stored != SCHEMA_VERSION:
+            conn.execute("INSERT OR REPLACE INTO meta VALUES ('schema', ?)", (str(SCHEMA_VERSION),))
+
     @contextmanager
-    def _db(self) -> Iterator[sqlite3.Connection]:
+    def _db(self, *, write: bool) -> Iterator[sqlite3.Connection]:
+        """Conexão com uma transação: BEGIN IMMEDIATE para gravar, BEGIN para ler.
+
+        Leitura não cria o arquivo: sem journal, avisa para sincronizar.
+        """
+        if not write and not self._path.is_file():
+            raise JournalError(_EMPTY)
         try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            conn = sqlite3.connect(self._path, timeout=10)
+            if write:
+                self._path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(self._path, timeout=10, isolation_level=None)
         except (OSError, sqlite3.Error) as exc:
             raise JournalError(f"Não foi possível abrir o journal ({self._path}): {exc}") from exc
         conn.row_factory = sqlite3.Row
         try:
-            with conn:  # uma transação: grava tudo ou nada
-                conn.executescript(_SCHEMA)
-                row = conn.execute("SELECT valor FROM meta WHERE chave = 'schema'").fetchone()
-                if row is None:
-                    conn.execute("INSERT INTO meta VALUES ('schema', ?)", (str(SCHEMA_VERSION),))
-                elif int(row["valor"]) > SCHEMA_VERSION:
-                    raise JournalError(
-                        f"O journal ({self._path}) foi criado por uma versão mais nova do servidor "
-                        f"(schema {row['valor']}); atualize o trading-mcp."
-                    )
+            self._prepare(conn, write)
+            conn.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+            try:
                 yield conn
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+            conn.execute("COMMIT")
         except sqlite3.Error as exc:
             raise JournalError(f"Erro no banco do journal ({self._path}): {exc}") from exc
         finally:
@@ -293,17 +350,39 @@ class Journal:
     def _account(self, conn: sqlite3.Connection) -> tuple[int, str]:
         account = self._meta(conn, "ultima_conta")
         if not account:
-            raise JournalError("O journal ainda está vazio: rode `journal_sincronizar` para importar as operações do MT5.")
+            raise JournalError(_EMPTY)
         return int(account["login"]), str(account["servidor"])
+
+    @staticmethod
+    def _find(conn: sqlite3.Connection, login: int, server: str, position_id: int) -> sqlite3.Row | None:
+        return conn.execute(
+            "SELECT * FROM operacoes WHERE conta_login = ? AND conta_servidor = ? AND posicao_id = ?",
+            (login, server, position_id),
+        ).fetchone()
+
+    def _snapshot(self, login: int, server: str, position_ids: list[int]) -> dict[int, dict]:
+        """Operações já gravadas, lidas sem trava de escrita (o cálculo vem antes da gravação)."""
+        if not position_ids or not self._path.is_file():
+            return {}
+        try:
+            with self._db(write=False) as conn:
+                return {
+                    pid: dict(row) for pid in position_ids if (row := self._find(conn, login, server, pid)) is not None
+                }
+        except JournalError as exc:
+            if str(exc) == _EMPTY:
+                return {}
+            raise
 
     # ------------------------------------------------------------------ sincronização
     @staticmethod
     def _initial_stop(
-        facts: dict, orders: list[dict], existing: sqlite3.Row | None, open_position: dict | None, now: datetime
+        facts: dict, orders: list[dict], existing: dict | None, open_position: dict | None, now: datetime
     ) -> dict[str, Any]:
         """Stop/alvo iniciais: informado > ordem de abertura > primeira observação da posição aberta."""
+        keys = ("stop_inicial", "alvo_inicial", "stop_inicial_fonte", "stop_inicial_em_utc")
         if existing is not None and existing["stop_inicial_fonte"] == "informado":
-            return {k: existing[k] for k in ("stop_inicial", "alvo_inicial", "stop_inicial_fonte", "stop_inicial_em_utc")}
+            return {k: existing[k] for k in keys}
         opening = next((o for o in orders if o["ticket"] == facts["ordem_abertura"]), None)
         if opening is not None and opening["stop_loss"]:
             return {
@@ -313,7 +392,7 @@ class Journal:
                 "stop_inicial_em_utc": _iso(opening["colocada"]),
             }
         if existing is not None and existing["stop_inicial_fonte"] in ("ordem_de_abertura", "observado"):
-            return {k: existing[k] for k in ("stop_inicial", "alvo_inicial", "stop_inicial_fonte", "stop_inicial_em_utc")}
+            return {k: existing[k] for k in keys}
         if open_position is not None and open_position["stop_loss"]:
             return {
                 "stop_inicial": open_position["stop_loss"],
@@ -335,31 +414,63 @@ class Journal:
         loss = self._mt5.profit(symbol, side, volume, entry, stop)
         return round(-loss, 2) if loss < 0 else None
 
-    def _news(self, facts: dict, existing: sqlite3.Row | None, now: datetime, warnings: list[str]) -> dict[str, Any]:
-        if existing is not None and existing["noticia_fonte"] == "informado":
-            return {k: existing[k] for k in ("noticia", "noticia_fonte", "noticias")}
-        kept = (
-            {k: existing[k] for k in ("noticia", "noticia_fonte", "noticias")}
-            if existing is not None and existing["noticia_fonte"] == "calendario"
-            else {"noticia": "desconhecido", "noticia_fonte": None, "noticias": None}
+    def _risk_for(self, pid: int, facts: dict, stop: dict, existing: dict | None, warnings: list[str]) -> float | None:
+        """Risco inicial; congelado numa operação fechada já calculada e mantido se o MT5 falhar."""
+        same = (
+            existing is not None
+            and existing["stop_inicial"] == stop["stop_inicial"]
+            and abs(existing["volume_entrada"] - facts["volume_entrada"]) <= _VOLUME_EPS
+            and existing["preco_entrada"] == facts["preco_entrada"]
         )
+        kept = existing["risco_inicial"] if same else None  # type: ignore[index]
+        if kept is not None and existing["status"] == "fechada":  # type: ignore[index]
+            return kept
+        try:
+            risk = self._risk(facts["simbolo"], facts["lado"], facts["volume_entrada"], facts["preco_entrada"],
+                              stop["stop_inicial"])
+        except MT5Error as exc:
+            suffix = "; mantido o valor anterior" if kept is not None else ""
+            warnings.append(f"Risco inicial da posição {pid} não recalculado ({exc}){suffix}.")
+            return kept
+        if stop["stop_inicial"] is not None and risk is None:
+            warnings.append(
+                f"Posição {pid}: o stop inicial ({stop['stop_inicial_fonte']}) não fica do lado da perda; risco "
+                "inicial e R ficam vazios (informe o stop original com `journal_anotar`)."
+            )
+        return risk
+
+    def _news(self, facts: dict, existing: dict | None, now: datetime, warnings: list[str]) -> dict[str, Any]:
+        keys = ("noticia", "noticia_fonte", "noticias", "noticia_ate_utc")
+        if existing is not None and existing["noticia_fonte"] == "informado":
+            return {k: existing.get(k) for k in keys}
+        unknown = {"noticia": "desconhecido", "noticia_fonte": None, "noticias": None, "noticia_ate_utc": None}
+        end = facts["fechamento"] or now
+        kept = (
+            {k: existing.get(k) for k in keys}
+            if existing is not None and existing["noticia_fonte"] == "calendario"
+            else dict(unknown)
+        )
+        # Um "nao" verificado só até antes do fim da operação não vale mais: o resto não foi visto.
+        if kept["noticia"] == "nao" and (_parse(kept["noticia_ate_utc"]) or datetime.min.replace(tzinfo=timezone.utc)) < end:
+            kept = dict(unknown)
         if self._calendar is None:
             return kept
-        start = facts["abertura"] - NEWS_BEFORE
-        end = facts["fechamento"] or now
         try:
-            events, covered = self._calendar.events_between(start, end, NEWS_IMPORTANCE)
+            events, covered = self._calendar.events_between(facts["abertura"] - NEWS_BEFORE, end, NEWS_IMPORTANCE)
         except CalendarError as exc:
             if not any(w.startswith("Calendário indisponível") for w in warnings):
                 warnings.append(f"Calendário indisponível: notícia não marcada ({exc})")
             return kept
-        if not covered:
-            return kept
-        return {
-            "noticia": "sim" if events else "nao",
-            "noticia_fonte": "calendario",
-            "noticias": json.dumps(events, ensure_ascii=False) if events else None,
-        }
+        if events:  # evento encontrado vale mesmo que o arquivo não cubra a operação inteira
+            return {
+                "noticia": "sim",
+                "noticia_fonte": "calendario",
+                "noticias": json.dumps(events, ensure_ascii=False),
+                "noticia_ate_utc": _iso(end),
+            }
+        if covered:
+            return {"noticia": "nao", "noticia_fonte": "calendario", "noticias": None, "noticia_ate_utc": _iso(end)}
+        return kept
 
     def sync(self, days: float = 7) -> dict[str, Any]:
         """Importa do MT5 as posições com negócios nos últimos ``days`` dias e as posições abertas."""
@@ -373,48 +484,59 @@ class Journal:
         if not account["is_demo"]:
             warnings.append(f"ATENÇÃO: a conta conectada NÃO é demo (tipo: {account['tipo_conta']}).")
 
-        # Tudo do MT5 é lido antes de abrir a transação do banco.
+        # 1) MT5: posições abertas, negócios da janela e o histórico completo de cada posição.
         open_positions = {p["identificador"]: p for p in self._mt5.open_positions()}
         window = self._mt5.deals(start, now + timedelta(minutes=1))
         trading = [d for d in window if d["tipo"] in ("buy", "sell") and d["posicao_id"]]
         position_ids = sorted({d["posicao_id"] for d in trading} | set(open_positions))
-        positions = []
+        gathered = []
         for pid in position_ids:
             deals = [d for d in self._mt5.deals(position=pid) if d["tipo"] in ("buy", "sell")]
             if not deals:
+                continue
+            if not any(d["entrada"] in ("in", "inout") and d["motivo"] not in _SERVICE_REASONS for d in deals):
+                warnings.append(f"Posição {pid}: o histórico não tem o negócio de entrada; ignorada.")
                 continue
             try:
                 orders = self._mt5.position_orders(pid)
             except MT5Error as exc:
                 orders = []
                 warnings.append(f"Ordens da posição {pid} não lidas (stop inicial pela ordem indisponível): {exc}")
-            positions.append((pid, deals, orders, _summarize(deals)))
+            facts = _summarize(deals)
+            facts["incompleta"] = facts["status"] != "fechada" and pid not in open_positions
+            if facts["incompleta"]:
+                warnings.append(
+                    f"Posição {pid}: os negócios indicam posição {facts['status']}, mas ela não está entre as abertas "
+                    "(histórico incompleto ou fechada durante a leitura)."
+                )
+            if facts["reversao"]:
+                warnings.append(f"Posição {pid} tem reversão (conta netting, não suportada): entrada e saída aproximadas.")
+            gathered.append((pid, deals, orders, facts))
 
+        # 2) Stop, risco e notícia calculados sobre um retrato do banco, sem trava de escrita.
+        snapshot = self._snapshot(login, server, [g[0] for g in gathered])
+        planned = []
+        for pid, deals, orders, facts in gathered:
+            existing = snapshot.get(pid)
+            stop = self._initial_stop(facts, orders, existing, open_positions.get(pid), now)
+            risk = self._risk_for(pid, facts, stop, existing, warnings)
+            news = self._news(facts, existing, now, warnings)
+            planned.append((pid, deals, facts, stop, risk, news))
+
+        # 3) Gravação numa transação IMMEDIATE, relendo cada operação: o que o usuário informou nesse
+        # meio-tempo prevalece.
         created = updated = 0
-        with self._db() as conn:
-            for pid, deals, orders, facts in positions:
-                existing = conn.execute(
-                    "SELECT * FROM operacoes WHERE conta_login = ? AND conta_servidor = ? AND posicao_id = ?",
-                    (login, server, pid),
-                ).fetchone()
-                stop = self._initial_stop(facts, orders, existing, open_positions.get(pid), now)
-                risk = None
-                risk_failed = False
-                try:
-                    risk = self._risk(
-                        facts["simbolo"], facts["lado"], facts["volume_entrada"], facts["preco_entrada"], stop["stop_inicial"]
-                    )
-                except MT5Error as exc:
-                    risk_failed = True
-                    warnings.append(f"Risco inicial da posição {pid} não calculado: {exc}")
-                if stop["stop_inicial"] is not None and risk is None and not risk_failed:
-                    warnings.append(
-                        f"Posição {pid}: o stop inicial ({stop['stop_inicial_fonte']}) não fica do lado da perda; "
-                        "risco inicial e R ficam vazios (informe o stop original com `journal_anotar`)."
-                    )
-                if facts["reversao"]:
-                    warnings.append(f"Posição {pid} tem reversão (conta netting): entrada e saída são aproximadas.")
-                news = self._news(facts, existing, now, warnings)
+        with self._db(write=True) as conn:
+            for pid, deals, facts, stop, risk, news in planned:
+                existing = self._find(conn, login, server, pid)
+                if existing is not None:
+                    if facts["incompleta"] and existing["status"] == "fechada":
+                        continue  # não troca uma operação fechada por um histórico incompleto
+                    if existing["stop_inicial_fonte"] == "informado":
+                        stop = {k: existing[k] for k in stop}
+                        risk = existing["risco_inicial"]
+                    if existing["noticia_fonte"] == "informado":
+                        news = {k: existing[k] for k in news}
                 for d in deals:
                     conn.execute(
                         "INSERT OR REPLACE INTO negocios VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -462,14 +584,20 @@ class Journal:
                     updated += 1
             self._set_meta(conn, "ultima_conta", {"login": login, "servidor": server})
             self._set_meta(conn, f"sincronizado:{login}:{server}", _iso(now))
+            scope = "conta_login = ? AND conta_servidor = ?"
+            missing_count = conn.execute(
+                f"SELECT COUNT(*) FROM operacoes WHERE {scope} AND stop_inicial IS NULL", (login, server)
+            ).fetchone()[0]
             missing = conn.execute(
-                "SELECT id, posicao_id, simbolo, abertura_utc FROM operacoes WHERE conta_login = ? AND "
-                "conta_servidor = ? AND stop_inicial IS NULL ORDER BY abertura_utc DESC LIMIT 20",
+                f"SELECT id, posicao_id, simbolo, abertura_utc FROM operacoes WHERE {scope} AND stop_inicial IS NULL "
+                "ORDER BY abertura_utc DESC LIMIT 20",
                 (login, server),
             ).fetchall()
+            observed = conn.execute(
+                f"SELECT COUNT(*) FROM operacoes WHERE {scope} AND stop_inicial_fonte = 'observado'", (login, server)
+            ).fetchone()[0]
             open_count = conn.execute(
-                "SELECT COUNT(*) FROM operacoes WHERE conta_login = ? AND conta_servidor = ? AND status != 'fechada'",
-                (login, server),
+                f"SELECT COUNT(*) FROM operacoes WHERE {scope} AND status != 'fechada'", (login, server)
             ).fetchone()[0]
 
         result: dict[str, Any] = {
@@ -485,10 +613,16 @@ class Journal:
             ],
             "banco": str(self._path),
         }
-        if missing:
+        if missing_count:
+            shown = f" (mostrando {len(missing)})" if missing_count > len(missing) else ""
             warnings.append(
-                f"{len(missing)} operação(ões) sem stop inicial conhecido: sem risco inicial nem R. Informe com "
+                f"{missing_count} operação(ões) sem stop inicial conhecido{shown}: sem risco inicial nem R. Informe com "
                 "`journal_anotar` (stop_inicial)."
+            )
+        if observed:
+            warnings.append(
+                f"{observed} operação(ões) com stop inicial 'observado' (visto com a posição aberta, pode já ter sido "
+                "movido): confirme ou corrija com `journal_anotar` para o R valer."
             )
         if warnings:
             result["avisos"] = warnings
@@ -514,23 +648,31 @@ class Journal:
             raise ValueError("Nada para anotar: informe setup, tags, motivo, observacao, stop_inicial ou noticia.")
         if news is not None and news not in ("sim", "nao"):
             raise ValueError("noticia deve ser 'sim' ou 'nao'.")
+        if not self._path.is_file():
+            raise JournalError(_EMPTY)
         now = self._now()
         warnings: list[str] = []
-        with self._db() as conn:
+        with self._db(write=True) as conn:
             if operation_id is not None:
                 row = conn.execute("SELECT * FROM operacoes WHERE id = ?", (operation_id,)).fetchone()
             else:
                 login, server = self._account(conn)
-                row = conn.execute(
-                    "SELECT * FROM operacoes WHERE conta_login = ? AND conta_servidor = ? AND posicao_id = ?",
-                    (login, server, ticket),
-                ).fetchone()
+                row = self._find(conn, login, server, ticket)  # type: ignore[arg-type]
             if row is None:
                 which = f"id {operation_id}" if operation_id is not None else f"ticket {ticket}"
                 raise ValueError(f"Operação não encontrada ({which}). Rode `journal_sincronizar` e confira em `journal_listar`.")
             changes: dict[str, Any] = {}
             if setup is not None:
-                changes["setup"] = setup.strip() or None
+                name = setup.strip() or None
+                if name:
+                    # Reaproveita a grafia já usada ("OB" e "ob" são o mesmo setup).
+                    same = conn.execute(
+                        "SELECT setup FROM operacoes WHERE conta_login = ? AND conta_servidor = ? AND "
+                        "LOWER(setup) = LOWER(?) LIMIT 1",
+                        (row["conta_login"], row["conta_servidor"], name),
+                    ).fetchone()
+                    name = same[0] if same else name
+                changes["setup"] = name
             if tags is not None:
                 cleaned = sorted({t.strip().lower() for t in tags.split(",") if t.strip()})
                 changes["tags"] = ", ".join(cleaned) or None
@@ -556,7 +698,7 @@ class Journal:
                     changes["risco_inicial"] = self._risk(row["simbolo"], side, row["volume_entrada"], entry, initial_stop)
                 except MT5Error as exc:
                     changes["risco_inicial"] = None
-                    warnings.append(f"Risco inicial não calculado agora ({exc}); sai na próxima sincronização.")
+                    warnings.append(f"Risco inicial não calculado agora ({exc}); sai na próxima sincronização da conta.")
             changes["atualizado_utc"] = _iso(now)
             assignments = ", ".join(f"{k} = ?" for k in changes)
             conn.execute(f"UPDATE operacoes SET {assignments} WHERE id = ?", (*changes.values(), row["id"]))
@@ -571,6 +713,7 @@ class Journal:
     def _view(row: sqlite3.Row) -> dict[str, Any]:
         r = dict(row)
         opened, closed = _parse(r["abertura_utc"]), _parse(r["fechamento_utc"])
+        closed_trade = r["status"] == "fechada"
         view: dict[str, Any] = {
             "id": r["id"],
             "ticket": r["posicao_id"],
@@ -590,7 +733,7 @@ class Journal:
             "stop_inicial_fonte": r["stop_inicial_fonte"],
             "alvo_inicial": r["alvo_inicial"],
             "risco_inicial": r["risco_inicial"],
-            "resultado_liquido": r["resultado_liquido"],
+            "resultado_liquido" if closed_trade else "resultado_realizado": r["resultado_liquido"],
             "resultado_bruto": r["resultado_bruto"],
             "custos": {"comissao": r["comissao"], "swap": r["swap"], "taxas": r["taxas"]},
             "r": _r_multiple(r),
@@ -602,6 +745,13 @@ class Journal:
             "motivo": r["motivo"],
             "observacoes": r["observacoes"],
         }
+        if not closed_trade:
+            view["nota_resultado"] = (
+                "Operação ainda aberta: só a parte realizada (comissões e saídas parciais). O resultado flutuante "
+                "está em `posicoes`."
+            )
+            if r["noticia"] == "nao" and r.get("noticia_ate_utc"):
+                view["noticia_verificada_ate"] = _show(r["noticia_ate_utc"])
         if r["status"] == "parcial":
             view["volume_fechado"] = r["volume_saida"]
         if r["entradas"] > 1 and r["risco_inicial"] is not None:
@@ -628,21 +778,14 @@ class Journal:
         status: str | None = None,
         limit: int = 30,
     ) -> dict[str, Any]:
-        where: list[str] = []
-        params: list[Any] = []
+        where, params = _filters(symbol, setup)
         if days:
             where.append("abertura_utc >= ?")
             params.append(_iso(self._now() - timedelta(days=days)))
-        if symbol.strip():
-            where.append("UPPER(simbolo) LIKE ?")
-            params.append(f"{symbol.strip().upper()}%")
-        if setup.strip():
-            where.append("LOWER(setup) = ?")
-            params.append(setup.strip().lower())
         if status:
             where.append("status = ?")
             params.append(status)
-        with self._db() as conn:
+        with self._db(write=False) as conn:
             rows = self._rows(conn, where, params, "abertura_utc DESC")
             login, server = self._account(conn)
             setups = [
@@ -664,36 +807,33 @@ class Journal:
 
     def stats(self, *, days: float | None = None, symbol: str = "", setup: str = "") -> dict[str, Any]:
         """Estatísticas das operações fechadas (por data de fechamento)."""
-        where = ["status = 'fechada'"]
-        params: list[Any] = []
-        now = self._now()
+        where, params = _filters(symbol, setup)
+        closed_where, closed_params = [*where, "status = 'fechada'"], list(params)
         if days:
-            where.append("fechamento_utc >= ?")
-            params.append(_iso(now - timedelta(days=days)))
-        if symbol.strip():
-            where.append("UPPER(simbolo) LIKE ?")
-            params.append(f"{symbol.strip().upper()}%")
-        if setup.strip():
-            where.append("LOWER(setup) = ?")
-            params.append(setup.strip().lower())
-        with self._db() as conn:
-            rows = [dict(r) for r in self._rows(conn, where, params, "fechamento_utc")]
+            closed_where.append("fechamento_utc >= ?")
+            closed_params.append(_iso(self._now() - timedelta(days=days)))
+        with self._db(write=False) as conn:
+            rows = [dict(r) for r in self._rows(conn, closed_where, closed_params, "fechamento_utc")]
+            not_closed = len(self._rows(conn, [*where, "status != 'fechada'"], params, "id"))
             login, server = self._account(conn)
-            not_closed = conn.execute(
-                "SELECT COUNT(*) FROM operacoes WHERE conta_login = ? AND conta_servidor = ? AND status != 'fechada'",
-                (login, server),
-            ).fetchone()[0]
             synced = self._meta(conn, f"sincronizado:{login}:{server}")
         for r in rows:
             r["r"] = _r_multiple(r)
         notes = list(_STATS_NOTES)
         if not_closed:
             notes.append(f"{not_closed} operação(ões) aberta(s) ou parcialmente fechada(s) ficaram de fora.")
+        general = _stats(rows)
+        observed = general["r"]["por_fonte_do_stop"].get("observado", 0)
+        if observed:
+            notes.append(
+                f"{observed} R vêm de stop 'observado' (visto com a posição aberta; pode já ter sido movido, o que "
+                "infla o R). Confirme o stop original com `journal_anotar`."
+            )
         return {
             "conta": {"login": login, "servidor": server},
             "ultima_sincronizacao": _show(synced),
             "filtro": {"dias": days, "simbolo": symbol or None, "setup": setup or None},
-            "geral": _stats(rows),
+            "geral": general,
             "por_setup": _group(rows, lambda r: r["setup"] or "sem setup"),
             "por_simbolo": _group(rows, lambda r: r["simbolo"]),
             "por_noticia": _group(rows, lambda r: r["noticia"]),
@@ -704,20 +844,26 @@ class Journal:
     # ------------------------------------------------------------------ exportação
     def export(self) -> dict[str, Any]:
         """Cópia do banco e CSV das operações (separador ';' e vírgula decimal, como o Excel em português)."""
+        with self._db(write=False) as conn:
+            rows = [dict(r) for r in conn.execute("SELECT * FROM operacoes ORDER BY abertura_utc")]
         stamp = self._now().strftime("%Y%m%d-%H%M%S")
         try:
             self._export_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             raise JournalError(f"Não foi possível criar a pasta de exportação ({self._export_dir}): {exc}") from exc
-        backup_path = self._export_dir / f"journal-{stamp}.sqlite3"
-        csv_path = self._export_dir / f"operacoes-{stamp}.csv"
-        with self._db() as conn:
-            rows = [dict(r) for r in conn.execute("SELECT * FROM operacoes ORDER BY abertura_utc")]
-            try:
-                with closing(sqlite3.connect(backup_path)) as target:
-                    conn.backup(target)
-            except (OSError, sqlite3.Error) as exc:
-                raise JournalError(f"Não foi possível gravar a cópia do journal ({backup_path}): {exc}") from exc
+        suffix = ""
+        for n in range(1, 100):
+            backup_path = self._export_dir / f"journal-{stamp}{suffix}.sqlite3"
+            csv_path = self._export_dir / f"operacoes-{stamp}{suffix}.csv"
+            if not backup_path.exists() and not csv_path.exists():
+                break
+            suffix = f"-{n}"
+        # VACUUM INTO: cópia consistente que respeita o tempo de espera do banco (sem transação aberta).
+        try:
+            with closing(sqlite3.connect(self._path, timeout=10, isolation_level=None)) as source:
+                source.execute("VACUUM INTO ?", (str(backup_path),))
+        except sqlite3.Error as exc:
+            raise JournalError(f"Não foi possível gravar a cópia do journal ({backup_path}): {exc}") from exc
         columns = list(rows[0]) if rows else ["id"]
 
         def cell(value: Any) -> Any:

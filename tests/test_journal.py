@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import sqlite3
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -216,7 +217,8 @@ def test_stats_are_deterministic_with_samples_and_gaps(tmp_path):
     assert g["operacoes"] == 2 and g["ganhos"] == 1 and g["perdas"] == 1 and g["empates"] == 0
     assert g["taxa_acerto_pct"] == 50.0 and g["resultado_liquido"] == -40.7 and g["resultado_medio"] == -20.35
     assert g["ganho_medio"] == 9.3 and g["perda_media"] == -50.0 and g["fator_lucro"] == 0.19
-    assert g["r"] == {"operacoes_com_r": 1, "sem_risco_inicial": 1, "r_total": 0.19, "r_medio": 0.19}
+    assert g["r"] == {"operacoes_com_r": 1, "sem_risco_inicial": 1, "r_total": 0.19, "r_medio": 0.19,
+                      "por_fonte_do_stop": {"ordem_de_abertura": 1}}
     assert g["custos"]["comissao"] == -0.7 and g["amostra_pequena"] is True
     setups = {x["grupo"]: x for x in s["por_setup"]}
     assert setups["OB"]["operacoes"] == 1 and setups["sem setup"]["resultado_liquido"] == -50.0
@@ -295,3 +297,203 @@ def test_client_deals_require_timezone_and_map_fields(tmp_path):
     tp_exit = next(d for d in deals if d["ticket"] == 12)
     assert tp_exit["entrada"] == "out" and tp_exit["motivo"] == "alvo" and tp_exit["tipo"] == "sell"
     assert client.position_orders(100)[0]["stop_loss"] == 1.095
+
+
+# ---------------------------------------------------------------- correções da auditoria
+def _run_with_timeout(func, seconds=15):
+    """Roda ``func`` numa thread; falha se travar (o export travava num journal novo)."""
+    box = {}
+
+    def target():
+        try:
+            box["value"] = func()
+        except Exception as exc:  # noqa: BLE001
+            box["error"] = exc
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(seconds)
+    assert not thread.is_alive(), "travou"
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
+
+
+def test_export_right_after_first_sync_does_not_hang(tmp_path):
+    journal, _, _ = _journal(tmp_path)
+    journal.sync(7)
+    out = _run_with_timeout(journal.export)
+    assert out["operacoes"] == 3
+    assert _run_with_timeout(lambda: journal.list_operations(days=None))["total"] == 3  # banco não ficou travado
+
+
+def test_read_tools_never_create_the_database(tmp_path):
+    journal, _, _ = _journal(tmp_path)
+    for call in (journal.list_operations, journal.stats, journal.export, lambda: journal.annotate(ticket=1, setup="x")):
+        with pytest.raises(JournalError, match="journal_sincronizar"):
+            call()
+    assert not (tmp_path / "j").exists()
+
+
+def test_informed_stop_beats_opening_order(tmp_path):
+    journal, _, _ = _journal(tmp_path)
+    journal.sync(7)
+    journal.annotate(ticket=100, initial_stop=1.094)
+    journal.sync(7)
+    op = _ops(journal)[100]
+    assert op["stop_inicial"] == 1.094 and op["stop_inicial_fonte"] == "informado" and op["risco_inicial"] == 60.0
+
+
+def test_annotation_during_sync_is_not_overwritten(tmp_path):
+    journal_box = {}
+
+    class AnnotatingCalendar(StubCalendar):
+        def events_between(self, start, end, min_importance="alta"):
+            if not self.calls:  # o usuário anota enquanto a sincronização calcula
+                journal_box["j"].annotate(ticket=100, initial_stop=1.094, news="sim")
+            return super().events_between(start, end, min_importance)
+
+    journal, _, _ = _journal(tmp_path)
+    journal.sync(7)
+    journal._calendar = AnnotatingCalendar()
+    journal_box["j"] = journal
+    journal.sync(7)
+    op = _ops(journal)[100]
+    assert op["stop_inicial"] == 1.094 and op["stop_inicial_fonte"] == "informado" and op["noticia"] == "sim"
+
+
+def test_mt5_failure_on_resync_keeps_risk(tmp_path, monkeypatch):
+    journal, client, _ = _journal(tmp_path)
+    journal.sync(7)
+
+    def fail(*args, **kwargs):
+        raise MT5Error("order_calc_profit falhou")
+
+    monkeypatch.setattr(client, "profit", fail)
+    out = journal.sync(7)
+    ops = _ops(journal)
+    assert ops[300]["risco_inicial"] == 20.0  # aberta: recalcularia, mas o MT5 falhou -> mantém
+    assert ops[100]["risco_inicial"] == 50.0  # fechada: congelada, nem tenta
+    assert any("mantido o valor anterior" in w for w in out["avisos"])
+
+
+def _close_300(fake, client, minutes_after=30):
+    client.clock.now = NOW + timedelta(hours=1)
+    fake.positions = []
+    fake.deals.append(make_deal(32, 300, EUR, "sell", OUT, 0.1, 1.10100, int((NOW + timedelta(minutes=minutes_after)).timestamp()),
+                                order=301, profit=20.0))
+
+
+def test_no_news_while_open_becomes_unknown_if_rest_was_not_checked(tmp_path):
+    cal = StubCalendar()
+    journal, client, fake = _journal(tmp_path, calendar=cal)
+    journal.sync(7)
+    assert _ops(journal)[300]["noticia"] == "nao" and "noticia_verificada_ate" in _ops(journal)[300]
+    _close_300(fake, client)
+    cal.covered_from = NOW + timedelta(days=1)  # o arquivo não cobre mais a operação
+    journal.sync(7)
+    assert _ops(journal)[300]["noticia"] == "desconhecido"
+
+
+def test_event_found_counts_even_when_file_does_not_cover_everything(tmp_path):
+    cal = StubCalendar()
+    journal, client, fake = _journal(tmp_path, calendar=cal)
+    journal.sync(7)
+    _close_300(fake, client)
+    cal.covered_from = NOW + timedelta(days=1)
+    cal.events = [(NOW + timedelta(minutes=15), "fomc")]
+    journal.sync(7)
+    assert _ops(journal)[300]["noticia"] == "sim"
+
+
+def test_observed_stop_is_flagged_in_stats_and_open_result_is_partial(tmp_path):
+    journal, client, fake = _journal(tmp_path)
+    out = journal.sync(7)
+    assert any("'observado'" in w for w in out["avisos"])
+    live = _ops(journal)[300]
+    assert "resultado_liquido" not in live and live["resultado_realizado"] == 0.0 and "flutuante" in live["nota_resultado"]
+    _close_300(fake, client)
+    journal.sync(7)
+    s = journal.stats()
+    assert s["geral"]["r"]["por_fonte_do_stop"] == {"ordem_de_abertura": 1, "observado": 1}
+    assert any("stop 'observado'" in n for n in s["observacoes"])
+    assert _ops(journal)[300]["resultado_liquido"] == 20.0
+
+
+def test_setup_spelling_is_reused(tmp_path):
+    journal, _, _ = _journal(tmp_path)
+    journal.sync(7)
+    journal.annotate(ticket=100, setup="OB")
+    assert journal.annotate(ticket=200, setup="ob")["setup"] == "OB"
+    assert [g["grupo"] for g in journal.stats()["por_setup"]] == ["OB"]
+
+
+def test_position_without_entry_deal_is_skipped(tmp_path):
+    deals = [make_deal(61, 600, EUR, "sell", OUT, 0.1, 1.1, at(1), order=601, profit=5.0)]
+    journal, _, _ = _journal(tmp_path, deals=deals, orders=[], positions=[])
+    out = journal.sync(7)
+    assert out["operacoes_novas"] == 0 and any("não tem o negócio de entrada" in w for w in out["avisos"])
+
+
+def test_service_deals_do_not_count_as_entries(tmp_path):
+    deals = [
+        make_deal(71, 700, EUR, "buy", IN, 0.1, 1.1, at(30), order=700),
+        make_deal(72, 700, EUR, "sell", OUT, 0.1, 1.1005, at(20), order=0, reason=fm.DEAL_REASON_ROLLOVER, swap=-1.0),
+        make_deal(73, 700, EUR, "buy", IN, 0.1, 1.1005, at(20), order=0, reason=fm.DEAL_REASON_ROLLOVER),
+        make_deal(74, 700, EUR, "sell", OUT, 0.1, 1.101, at(1), order=701, profit=10.0),
+    ]
+    journal, _, _ = _journal(tmp_path, deals=deals, orders=[], positions=[])
+    journal.sync(7)
+    op = _ops(journal)[700]
+    assert op["volume"] == 0.1 and op["entradas"] == 1 and op["status"] == "fechada"
+    assert op["resultado_liquido"] == 9.0  # o swap da rolagem entra no resultado
+
+
+def test_stats_note_about_open_trades_respects_filters(tmp_path):
+    journal, _, _ = _journal(tmp_path)
+    journal.sync(7)
+    assert not any("ficaram de fora" in n for n in journal.stats(symbol="XAU")["observacoes"])
+
+
+def test_missing_stop_warning_counts_all(tmp_path):
+    deals = []
+    for i in range(25):
+        pid = 1000 + i
+        deals += [make_deal(pid * 10, pid, EUR, "buy", IN, 0.1, 1.1, at(5), order=pid),
+                  make_deal(pid * 10 + 1, pid, EUR, "sell", OUT, 0.1, 1.1, at(4), order=pid + 5000)]
+    journal, _, _ = _journal(tmp_path, deals=deals, orders=[], positions=[])
+    out = journal.sync(7)
+    assert len(out["sem_stop_inicial"]) == 20
+    assert any(w.startswith("25 operação(ões) sem stop inicial conhecido (mostrando 20)") for w in out["avisos"])
+
+
+def test_version_1_database_is_migrated(tmp_path):
+    path = tmp_path / "j" / "journal.sqlite3"
+    path.parent.mkdir()
+    from trading_mcp import journal as module
+
+    old_schema = module._SCHEMA.replace("    noticia_ate_utc TEXT,\n", "")
+    assert "noticia_ate_utc" not in old_schema
+    with sqlite3.connect(path) as conn:
+        conn.executescript(old_schema)
+        conn.execute("INSERT INTO meta VALUES ('schema', '1')")
+    journal, _, _ = _journal(tmp_path)
+    journal.sync(7)
+    with sqlite3.connect(path) as conn:
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(operacoes)")}
+        assert "noticia_ate_utc" in columns
+        assert conn.execute("SELECT valor FROM meta WHERE chave = 'schema'").fetchone()[0] == "2"
+
+
+def test_newer_schema_is_not_touched(tmp_path):
+    path = tmp_path / "j" / "journal.sqlite3"
+    path.parent.mkdir()
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE meta (chave TEXT PRIMARY KEY, valor TEXT NOT NULL)")
+        conn.execute("INSERT INTO meta VALUES ('schema', '9')")
+    journal, _, _ = _journal(tmp_path)
+    with pytest.raises(JournalError, match="versão mais nova"):
+        journal.sync(7)
+    with sqlite3.connect(path) as conn:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    assert tables == {"meta"}  # o servidor antigo não criou tabelas no banco novo
