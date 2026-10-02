@@ -7,7 +7,7 @@ import pytest
 from trading_mcp.config import load_settings
 
 KEYS = ("MT5_PATH", "MT5_LOGIN", "MT5_PASSWORD", "MT5_SERVER", "MT5_TIMEOUT_MS", "SYMBOL_SUFFIX", "MAX_BARS", "SEC_USER_AGENT",
-        "JOURNAL_PATH", "JOURNAL_EXPORT_DIR")
+        "JOURNAL_PATH", "JOURNAL_EXPORT_DIR", "INSTRUMENTOS")
 
 
 @pytest.fixture(autouse=True)
@@ -93,3 +93,17 @@ def test_journal_paths_default_outside_appdata_and_overridable(tmp_path: Path) -
     path = _write(tmp_path, text, "utf-8")
     s = load_settings(path)
     assert s.journal_path == tmp_path / "j.sqlite3" and s.journal_export_dir == tmp_path / "exp"
+
+
+def test_instruments_default_and_custom(tmp_path: Path) -> None:
+    assert load_settings(tmp_path / "nao_existe.env").instruments[:3] == ("USTEC", "US30", "JP225")
+    s = load_settings(_write(tmp_path, "INSTRUMENTOS= ustec, xauusd ,USTEC,,dxy\n", "utf-8"))
+    assert s.instruments == ("USTEC", "XAUUSD", "DXY")
+
+
+def test_journal_paths_expand_home_and_resolve_relative_to_project(tmp_path: Path) -> None:
+    from trading_mcp.config import PROJECT_ROOT
+
+    s = load_settings(_write(tmp_path, "JOURNAL_PATH=~/j.sqlite3\nJOURNAL_EXPORT_DIR=backups\n", "utf-8"))
+    assert s.journal_path == Path.home() / "j.sqlite3"
+    assert s.journal_export_dir == PROJECT_ROOT / "backups"

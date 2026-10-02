@@ -20,6 +20,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_JOURNAL_PATH = Path.home() / "trading-mcp" / "journal.sqlite3"
 # Cópias e CSVs são arquivos fechados: dentro do projeto, o OneDrive os leva para a nuvem.
 DEFAULT_JOURNAL_EXPORT_DIR = PROJECT_ROOT / "journal_export"
+# Instrumentos operados pelo usuário: reação a eventos e contexto entre ativos usam esta lista.
+DEFAULT_INSTRUMENTS = ("USTEC", "US30", "JP225", "XAUUSD", "GBPUSD", "EURUSD", "BTCUSD", "UKOIL", "DXY")
 
 
 def _decode(data: bytes) -> str:
@@ -100,6 +102,7 @@ class Settings:
     # Banco do journal (SQLite) e pasta das exportações/cópias de segurança.
     journal_path: Path = DEFAULT_JOURNAL_PATH
     journal_export_dir: Path = DEFAULT_JOURNAL_EXPORT_DIR
+    instruments: tuple[str, ...] = DEFAULT_INSTRUMENTS
     # Arquivo .env efetivamente usado (None = nenhum encontrado).
     env_file: str | None = None
     # Problemas encontrados na configuração do MT5.
@@ -109,6 +112,16 @@ class Settings:
 def default_env_file() -> Path:
     custom = os.environ.get("TRADING_MCP_ENV_FILE")
     return Path(custom) if custom else PROJECT_ROOT / ".env"
+
+
+def _get_path(env: dict[str, str], key: str, default: Path) -> Path:
+    """Caminho do .env com ~ expandido; relativo vale a partir da pasta do projeto, não da pasta de onde o
+    Claude Desktop iniciou o servidor."""
+    value = _get(env, key)
+    if value is None:
+        return default
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else PROJECT_ROOT / path
 
 
 def load_settings(env_file: Path | None = None) -> Settings:
@@ -125,6 +138,13 @@ def load_settings(env_file: Path | None = None) -> Settings:
         errors.append(f"MAX_BARS deve estar entre 1 e 50000, recebido: {max_bars}")
         max_bars = 5_000
 
+    raw_instruments = _get(env, "INSTRUMENTOS")
+    instruments = (
+        tuple(dict.fromkeys(i.strip().upper() for i in raw_instruments.split(",") if i.strip()))
+        if raw_instruments
+        else DEFAULT_INSTRUMENTS
+    ) or DEFAULT_INSTRUMENTS
+
     return Settings(
         mt5_path=_get(env, "MT5_PATH"),
         mt5_login=_get_int(env, "MT5_LOGIN", None, errors),
@@ -134,8 +154,9 @@ def load_settings(env_file: Path | None = None) -> Settings:
         symbol_suffix=_get(env, "SYMBOL_SUFFIX"),
         max_bars=max_bars,
         sec_user_agent=_get(env, "SEC_USER_AGENT"),
-        journal_path=Path(_get(env, "JOURNAL_PATH") or DEFAULT_JOURNAL_PATH),
-        journal_export_dir=Path(_get(env, "JOURNAL_EXPORT_DIR") or DEFAULT_JOURNAL_EXPORT_DIR),
+        journal_path=_get_path(env, "JOURNAL_PATH", DEFAULT_JOURNAL_PATH),
+        journal_export_dir=_get_path(env, "JOURNAL_EXPORT_DIR", DEFAULT_JOURNAL_EXPORT_DIR),
+        instruments=instruments,
         env_file=str(env_file) if env_file.is_file() else None,
         errors=tuple(errors),
     )

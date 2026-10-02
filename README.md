@@ -57,6 +57,7 @@ Copy-Item .env.example .env
 | `MAX_BARS` | Limite de candles buscados por chamada | Não (padrão: 5000) |
 | `JOURNAL_PATH` | Arquivo do journal (SQLite) | Não (padrão: `trading-mcp\journal.sqlite3` na pasta do seu usuário) |
 | `JOURNAL_EXPORT_DIR` | Pasta das cópias de segurança e CSVs do journal | Não (padrão: `journal_export` no projeto) |
+| `INSTRUMENTOS` | Instrumentos operados, separados por vírgula (reação a eventos e contexto entre ativos) | Não (padrão: `USTEC,US30,JP225,XAUUSD,GBPUSD,EURUSD,BTCUSD,UKOIL,DXY`) |
 
 O `.env` é lido da pasta raiz do projeto, mesmo que o servidor seja iniciado de outro lugar (`TRADING_MCP_ENV_FILE` aponta para outro arquivo, se preferir). Arquivos salvos pelo Bloco de Notas (com BOM ou UTF-16) funcionam. O `.env` está no `.gitignore` e nunca deve ir para o git.
 
@@ -84,6 +85,8 @@ Use uma instalação **separada** do MT5, logada **só** na conta demo, e aponte
 | `simbolos` | Busca símbolos disponíveis na conta | `busca` (ex.: USD, Apple), `limite` (1–200, padrão 30) |
 | `calendario` | Calendário econômico dos EUA: horário (UTC/SP/NY), importância, realizado, previsão, anterior, anterior revisado e surpresa | `horas_a_frente` (padrão 24), `horas_atras` (padrão 2), `importancia_minima`, `busca` (ex.: CPI, NFP, claims, FOMC) |
 | `fundamentos` | Fundamentos da SEC EDGAR (receita, lucro, LPA, ROE, margem) | `ticker` (ex.: AAPL, MSFT, BRK.B) |
+| `reacao_evento` | Fato publicado (realizado, previsão, surpresa) e, separado, o movimento de cada instrumento depois do evento | `evento` (ex.: CPI, NFP, claims) ou `horario_utc`, `simbolos` (padrão: `INSTRUMENTOS`), `janelas_min` (padrão 1, 5, 15) |
+| `contexto_mercado` | Instrumentos lado a lado: variação em 15 min, 1 h, 4 h e no dia, faixa do dia e estado da cotação | `simbolos` (padrão: `INSTRUMENTOS`) |
 | `journal_sincronizar` | Importa as operações da conta do histórico do MT5 para o journal (não duplica, não apaga anotações) | `dias` (padrão 7) |
 | `journal_anotar` | Anota uma operação: setup, tags, motivo, observação, stop inicial, notícia | `operacao_id` ou `ticket`, e os campos a gravar |
 | `journal_listar` | Operações com resultado, R, stop inicial, notícia e anotações | `dias` (padrão 30), `simbolo`, `setup`, `status`, `limite` |
@@ -99,6 +102,21 @@ Use uma instalação **separada** do MT5, logada **só** na conta demo, e aponte
 **Posições**: para cada posição, `stop.resultado_se_atingido` vai do preço de entrada até o stop atual (negativo = perda; positivo = lucro protegido) e `variacao_desde_agora` vai do preço atual até ele; o mesmo para o alvo. A `situacao` do stop é `com_risco`, `no_preco_de_entrada`, `lucro_protegido` ou `sem_stop`. Distância positiva = nível ainda não atingido; `ultrapassado` marca um stop ou alvo que o preço já passou (gap ou cotação parada), e aí a variação desde agora fica nula. `pontos` são pontos do MT5 (no USTECm, 0,01): para índices, a distância em pontos do índice é o campo `preco`. Os totais somam posição por posição, sem compensar posições opostas (a conta é hedging): `perda_nos_stops` (valor positivo) só soma stops com risco e não inclui posições sem stop; se faltar algum valor, os totais saem nulos em vez de parciais. Ordens pendentes trazem o resultado se forem executadas e o stop for atingido (na stop limitada, a entrada é o preço da limitada). São medições sobre o stop **atual**: o risco inicial e o resultado em R ficam para o journal (B3). Comissão não incluída; swap à parte.
 
 **Tamanho de posição**: a direção é deduzida (stop abaixo da entrada = compra). O resultado traz o risco com o lote arredondado, o efeito do spread atual nas compras (`risco_com_spread`) e a margem estimada. Ele recusa stop menor que o tick do símbolo e avisa quando o spread consome boa parte do stop ou quando a margem passa da margem livre. Comissão e swap não estão incluídos: em contas Raw Spread/Zero, some a comissão por lote.
+
+## Reação a eventos e contexto entre ativos
+
+`reacao_evento` separa três coisas que não devem se misturar: o **fato publicado** (do calendário: realizado, previsão, surpresa e outros eventos no mesmo horário), o **movimento medido** em cada instrumento e, por último, a interpretação, que fica com o Claude e deve citar as incertezas.
+
+- **Medição**: candles M1 de bid do MT5, em UTC, com resolução de 1 minuto (o horário tem de ser em minuto cheio). Referência = último preço antes do horário do evento; +1, +5 e +15 min = último preço antes de cada marca. Também mostra a máxima e a mínima na janela e o spread (mediana nos 5 min antes, máximo nos 2 min depois, pelos ticks).
+- **Movimento típico**: `vezes_o_tipico` divide o movimento pela mediana dos movimentos do mesmo tamanho nas 2 h antes do evento. Um 0,1% no EURUSD e um 0,1% no BTC não têm o mesmo peso; 3× o típico é uma reação clara, perto de 1× é ruído normal.
+- **Eventos em volta**: o fato publicado traz os eventos dos EUA do mesmo horário; `eventos_dentro_da_janela` lista os divulgados durante a medição (importância moderada ou alta) e `janelas_afetadas` diz quais janelas misturam mais de um evento. **O calendário é só dos EUA**: BCE, BoE, BoJ e OPEP não aparecem. A leitura direcional da MetaQuotes (`leitura_da_fonte`) fica separada dos fatos.
+- **Busca**: `evento` pega o dia mais recente com divulgação e, nele, o evento de maior importância mais cedo (em dia de FOMC, a decisão das 18:00, não a entrevista); os demais aparecem em `outros_candidatos`.
+- **Avisos de dados**: referência antiga (mercado parado antes do evento), sem negociação depois (mercado fechado), candle faltando no fim da janela, janelas que ainda não terminaram (`pendente`).
+- **Compare pela variação em %**: um ponto de USTEC, de ouro e de EURUSD não têm o mesmo peso. Pips só aparecem em pares de moedas (EURUSD, GBPUSD).
+- **Alcance**: os candles M1 vão até cerca de 3 meses para trás; o arquivo do calendário cobre 7 dias. Para eventos mais antigos, informe `horario_utc` (o movimento é medido, mas sem o fato publicado).
+- **Sem yields**: a conta não tem instrumento de Treasury; rendimentos não estão disponíveis. `DXYm` é um CFD da corretora e `JP225m` é cotado em ienes.
+
+`contexto_mercado` mostra os instrumentos operados lado a lado (variação em 15 min, 1 h, 4 h e desde o último preço antes de 00:00 UTC, e onde o preço está na faixa do dia). `desde` marca quando o preço de partida é mais antigo, porque o mercado estava fechado (o UKOIL, por exemplo, para às 21:00 UTC). Serve para ver, por exemplo, o dólar subindo junto com a queda do ouro e dos índices. Correlação aparente não indica causa.
 
 ## Journal
 
@@ -118,6 +136,8 @@ O journal registra as operações da conta demo para medir o que funciona. **O M
 - "Quanto perco se os stops das minhas posições forem atingidos? E quanto falta até cada stop?"
 - "Sincroniza o journal e anota a operação de hoje no USTEC: setup OB + FVG, entrei na varredura da mínima de Londres."
 - "Como estão minhas estatísticas por setup? E com notícia e sem notícia?"
+- "O Claims veio acima da previsão. Como reagiram USTEC, US30, ouro, DXY e as moedas nos primeiros 15 minutos?"
+- "Me dá o contexto entre ativos agora: dólar, ouro, índices, petróleo e BTC."
 - "Quantos lotes devo usar para arriscar 1% com entrada 1.0850 e stop 1.0820 no EURUSD?"
 - "Mostre os fundamentos da AAPL: receita, lucro, margem e ROE do último ano."
 - "Qual foi a variação percentual do XAUUSD nos últimos 50 candles em D1?"
@@ -200,6 +220,7 @@ src/trading_mcp/
 ├── calendario.py      # Calendário econômico (lê o arquivo do serviço MQL5)
 ├── posicoes.py        # Relatório de posições e ordens pendentes
 ├── journal.py         # Journal de operações em SQLite (importado do histórico do MT5)
+├── reacao.py          # Reação a eventos e contexto entre ativos
 ├── indicators.py      # Indicadores técnicos
 ├── risk.py            # Tamanho de posição e arredondamento de lote
 └── sec_edgar.py       # Fundamentos da SEC EDGAR
@@ -239,7 +260,7 @@ Revisado em 2026-10-01. Tudo continua somente leitura até a etapa F.
 
 - **A** (feito): base validada no MT5 real (identidade da conta, horários em UTC, estado da cotação).
 - **B** (feito): calendário econômico (B2), consulta de posições com distâncias e risco até o stop (B1) e journal em SQLite importado do MT5 (B3).
-- **C**: reação observada a eventos (janelas de 1/5/15 min alinhadas em UTC) e contexto entre ativos; notícias só depois de medir a latência das fontes gratuitas.
+- **C**: reação observada a eventos e contexto entre ativos para os instrumentos operados (feito: C1). Próximos: guardar as reações para estatísticas por tipo de surpresa (o calendário só cobre 7 dias), e notícias só depois de medir a latência das fontes gratuitas.
 - **D**: backtest de um único setup definido por regras objetivas.
 - **E**: propostas de operação com limites rígidos e aprovação humana fora do chat, ainda sem envio.
 - **F**: execução **somente em conta demo**, com verificação de conta imediatamente antes do envio, reconciliação e kill switch.

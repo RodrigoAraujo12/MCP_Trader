@@ -46,6 +46,7 @@ _ALLOWED_CALLS = frozenset(
         "symbol_select",
         "copy_rates_from_pos",
         "copy_rates_range",
+        "copy_ticks_range",
         "order_calc_profit",
         "order_calc_margin",
         "positions_get",
@@ -376,6 +377,8 @@ class MT5Client:
                     f"Não foi possível adicionar {resolved} ao Market Watch: {self._last_error()}"
                 )
             self._symbol_cache[key] = resolved
+            # O nome real também vira chave: chamadas seguintes com "USTECm" não refazem a busca.
+            self._symbol_cache.setdefault(resolved.upper(), resolved)
             return resolved
 
     def _find_symbol(self, key: str) -> str:
@@ -642,6 +645,59 @@ class MT5Client:
         df.attrs["horario_inconsistente"] = future
         df.attrs["conectado"] = connected
         return df
+
+    @staticmethod
+    def _require_utc(start: datetime, end: datetime) -> tuple[datetime, datetime]:
+        # Sem fuso, o MT5 lê a data como horário local do Windows (conferido em 2026-10-02).
+        if start.tzinfo is None or end.tzinfo is None:
+            raise ValueError("Informe início e fim com fuso horário (UTC).")
+        return start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+
+    @_guard
+    def rates_between(self, symbol: str, timeframe: str, start: datetime, end: datetime) -> pd.DataFrame:
+        """Candles com abertura entre ``start`` e ``end`` (UTC), do mais antigo ao mais novo; pode vir vazio.
+
+        Os candles do MT5 são de bid. ``df.attrs["conectado"]`` informa a conexão com a corretora.
+        """
+        tf_key = (timeframe or "").strip().upper()
+        if tf_key not in TIMEFRAMES:
+            raise ValueError(f"Timeframe inválido: '{timeframe}'. Válidos: {', '.join(TIMEFRAMES)}.")
+        start, end = self._require_utc(start, end)
+        with self._lock:
+            resolved = self.resolve_symbol(symbol)
+            tf = getattr(self._module(), TIMEFRAMES[tf_key])
+            past = end < self._now_utc() - timedelta(minutes=1)
+            for attempt in range(_RATES_ATTEMPTS):
+                if attempt:
+                    self._sleep(_RATES_RETRY_S)
+                data = self._call("copy_rates_range", resolved, tf, start, end)
+                if data is None:
+                    raise MT5Error(f"Sem candles de {resolved} em {tf_key}: {self._last_error()}")
+                # Histórico ainda não carregado volta vazio na primeira chamada; período em andamento pode
+                # estar vazio de verdade (mercado fechado), então só o passado é repetido.
+                if len(data) or not past:
+                    break
+            connected = self._connected
+        df = pd.DataFrame(data, columns=_RATE_COLUMNS) if len(data) else pd.DataFrame(columns=_RATE_COLUMNS)
+        df["time"] = pd.to_datetime(df["time"].astype("int64"), unit="s", utc=True)
+        df.attrs["conectado"] = connected
+        return df.reset_index(drop=True)
+
+    @_guard
+    def ticks_between(self, symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
+        """Mudanças de bid/ask entre ``start`` e ``end`` (UTC), com ``time`` em milissegundos convertido para UTC."""
+        start, end = self._require_utc(start, end)
+        with self._lock:
+            resolved = self.resolve_symbol(symbol)
+            mt5 = self._module()
+            data = self._call("copy_ticks_range", resolved, start, end, mt5.COPY_TICKS_INFO)
+            if data is None:
+                raise MT5Error(f"Sem ticks de {resolved}: {self._last_error()}")
+        df = pd.DataFrame(data)
+        if df.empty:
+            return pd.DataFrame(columns=["time", "bid", "ask"])
+        df["time"] = pd.to_datetime(df["time_msc"].astype("int64"), unit="ms", utc=True)
+        return df[["time", "bid", "ask"]].reset_index(drop=True)
 
     @_guard
     def loss_per_lot(self, symbol: str, entry: float, stop: float) -> tuple[float, str]:

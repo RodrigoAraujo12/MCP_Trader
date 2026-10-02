@@ -28,7 +28,7 @@ from trading_mcp.server import create_server
 
 EXPECTED_TOOLS = {
     "cotacao", "historico", "indicadores", "tamanho_posicao", "info_conta", "posicoes", "simbolos", "calendario",
-    "fundamentos", "journal_sincronizar", "journal_anotar", "journal_listar", "journal_estatisticas", "journal_exportar",
+    "fundamentos", "reacao_evento", "contexto_mercado", "journal_sincronizar", "journal_anotar", "journal_listar", "journal_estatisticas", "journal_exportar",
 }
 # Gravam só no arquivo local do journal; todas as demais são somente leitura.
 JOURNAL_WRITERS = {"journal_sincronizar", "journal_anotar", "journal_exportar"}
@@ -132,6 +132,31 @@ async def test_only_journal_tools_write_and_none_is_destructive() -> None:
             assert tool.annotations.read_only_hint is False and tool.annotations.destructive_hint is False
         else:
             assert tool.annotations.read_only_hint is True
+
+
+@pytest.mark.anyio
+async def test_reacao_and_contexto_use_configured_instruments() -> None:
+    import time
+
+    import numpy as np
+
+    from fake_mt5 import RATES_DTYPE
+
+    minute = int(time.time()) // 60 * 60
+    # EURUSDm: 1,10000 até 30 min atrás, 1,10050 depois.
+    rows = [(minute - 60 * i, 1.1, 1.1, 1.1, 1.1 if i > 30 else 1.1005, 10, 12, 0) for i in range(120, 0, -1)]
+    fake = _fake_mt5()
+    fake.rates["EURUSDm"] = np.array(rows, dtype=RATES_DTYPE)
+    event = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(minute - 30 * 60))
+    async with Client(_server(fake, instruments=("EURUSD", "USDJPY"))) as client:
+        reaction = _payload(await client.call_tool("reacao_evento", {"horario_utc": event}))
+        context = _payload(await client.call_tool("contexto_mercado", {}))
+        nothing = await client.call_tool("reacao_evento", {})
+    eur = reaction["movimento_medido"][0]
+    assert [m["simbolo"] for m in reaction["movimento_medido"]] == ["EURUSDm", "USDJPYm"]
+    assert eur["janelas"][0]["pips"] == 5.0
+    assert [i["simbolo"] for i in context["instrumentos"]] == ["EURUSDm", "USDJPYm"]
+    assert "Informe o evento" in _error_text(nothing)
 
 
 @pytest.mark.anyio

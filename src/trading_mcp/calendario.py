@@ -235,7 +235,10 @@ class EconomicCalendar:
         min_importance: str = "moderada",
         search: str = "",
         limit: int = 40,
+        start: datetime | None = None,
+        end: datetime | None = None,
     ) -> dict[str, Any]:
+        """Eventos entre agora - hours_back e agora + hours_ahead, ou entre ``start`` e ``end`` se informados."""
         level = IMPORTANCE_LEVELS.get((min_importance or "").strip().lower())
         if level is None:
             raise ValueError(f"importancia_minima deve ser baixa, moderada ou alta (recebido: {min_importance!r}).")
@@ -253,7 +256,8 @@ class EconomicCalendar:
 
         events = {ev["id"]: ev for ev in data.get("events", []) if isinstance(ev, dict) and "id" in ev}
         values = [v for v in data.get("values", []) if isinstance(v, dict)]
-        start, end = now - timedelta(hours=hours_back), now + timedelta(hours=hours_ahead)
+        start = start if start is not None else now - timedelta(hours=hours_back)
+        end = end if end is not None else now + timedelta(hours=hours_ahead)
         tokens = _normalize(search).split()
 
         rows: list[tuple[datetime, int, dict[str, Any]]] = []

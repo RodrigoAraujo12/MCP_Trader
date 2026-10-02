@@ -18,7 +18,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import ToolAnnotations
 from pydantic import Field
 
-from trading_mcp import indicators, posicoes as posicoes_report, risk, tempo
+from trading_mcp import indicators, posicoes as posicoes_report, reacao, risk, tempo
 from trading_mcp.calendario import CalendarError, EconomicCalendar
 from trading_mcp.config import Settings, load_settings
 from trading_mcp.journal import Journal, JournalError
@@ -66,6 +66,13 @@ Regras de uso:
   não zero. Com `estimativa` revisada, o `anterior` é a estimativa anterior do mesmo período. Separe o
   fato publicado da sua interpretação e não transforme surpresa em compra ou venda. Para medir reação
   de preço, use horários UTC alinhados e cite os eventos de `mesmo_horario`.
+- Reação a eventos (`reacao_evento`): apresente em três partes separadas: (1) o fato publicado e a surpresa;
+  (2) o movimento medido, comparando instrumentos pela variação em %; (3) só então a sua interpretação, com as
+  incertezas (outros eventos no mesmo horário ou em `eventos_dentro_da_janela`, mercado fechado, referência
+  antiga). Compare instrumentos por `vezes_o_tipico` (movimento / movimento típico das 2 h antes), não só por %.
+  O calendário é só dos EUA: eventos de outros países não aparecem. `leitura_da_fonte` é a interpretação da
+  MetaQuotes, não um fato. Não atribua causa como certeza e não transforme a reação em compra ou venda.
+- `contexto_mercado` mostra os instrumentos operados lado a lado; correlação aparente não é causa.
 - Journal: rode `journal_sincronizar` antes de listar, anotar ou tirar estatísticas (importa do MT5 sem
   duplicar e sem apagar anotações). Use `journal_anotar` para setup, motivo, observações e o stop inicial
   quando faltar; reaproveite os nomes de `setups_existentes`. As estatísticas vêm prontas do servidor: não
@@ -434,6 +441,45 @@ def create_server(
                 search=busca,
                 limit=limite,
             )
+
+    @server.tool(annotations=READ_ONLY)
+    def reacao_evento(
+        evento: Annotated[
+            str, Field(description="Evento no calendário, ex.: CPI, NFP, claims, FOMC (pega o mais recente já divulgado)")
+        ] = "",
+        horario_utc: Annotated[
+            str, Field(description="Horário exato do evento em UTC, ex.: 2026-10-01T12:30:00Z (eventos com mais de 7 dias)")
+        ] = "",
+        simbolos: Annotated[
+            list[str] | None, Field(description="Instrumentos; vazio = os operados (configurados no .env)")
+        ] = None,
+        janelas_min: Annotated[
+            list[int] | None, Field(description=f"Minutos depois do evento (1 a {reacao.MAX_WINDOW_MIN}); padrão 1, 5 e 15")
+        ] = None,
+    ) -> dict[str, Any]:
+        """Como os instrumentos se moveram depois de um evento: o fato publicado (realizado, previsão, surpresa) e,
+        separado, o movimento medido em +1/+5/+15 min, a maior alta e a maior queda e o spread. Não atribui causa.
+        """
+        with _tool_errors():
+            return reacao.reaction(
+                mt5,
+                calendar,
+                when=horario_utc,
+                search=evento,
+                symbols=simbolos or settings.instruments,
+                windows=janelas_min or reacao.DEFAULT_WINDOWS,
+            )
+
+    @server.tool(annotations=READ_ONLY)
+    def contexto_mercado(
+        simbolos: Annotated[
+            list[str] | None, Field(description="Instrumentos; vazio = os operados (configurados no .env)")
+        ] = None,
+    ) -> dict[str, Any]:
+        """Retrato entre ativos agora: variação em 15 min, 1 h, 4 h e no dia (UTC), faixa do dia e estado da
+        cotação de cada instrumento operado."""
+        with _tool_errors():
+            return reacao.context(mt5, simbolos or settings.instruments)
 
     @server.tool(annotations=JOURNAL_SYNC)
     def journal_sincronizar(

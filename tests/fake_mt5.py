@@ -24,6 +24,11 @@ TIMEFRAME_H6, TIMEFRAME_H8, TIMEFRAME_H12 = 16390, 16392, 16396
 TIMEFRAME_D1, TIMEFRAME_W1, TIMEFRAME_MN1 = 16408, 32769, 49153
 
 ORDER_TYPE_BUY, ORDER_TYPE_SELL = 0, 1
+COPY_TICKS_ALL, COPY_TICKS_INFO, COPY_TICKS_TRADE = -1, 1, 2
+TICK_DTYPE = np.dtype(
+    [("time", "<i8"), ("bid", "<f8"), ("ask", "<f8"), ("last", "<f8"), ("volume", "<u8"), ("time_msc", "<i8"),
+     ("flags", "<u4"), ("volume_real", "<f8")]
+)
 ORDER_TYPE_BUY_LIMIT, ORDER_TYPE_SELL_LIMIT, ORDER_TYPE_BUY_STOP, ORDER_TYPE_SELL_STOP = 2, 3, 4, 5
 ORDER_TYPE_BUY_STOP_LIMIT, ORDER_TYPE_SELL_STOP_LIMIT, ORDER_TYPE_CLOSE_BY = 6, 7, 8
 ORDER_TIME_GTC, ORDER_TIME_DAY, ORDER_TIME_SPECIFIED, ORDER_TIME_SPECIFIED_DAY = 0, 1, 2, 3
@@ -194,6 +199,13 @@ def make_balance_deal(ticket: int, amount: float, time: int) -> Record:
     )
 
 
+def make_ticks(rows: list[tuple[float, float, float]]) -> np.ndarray:
+    """Ticks a partir de (epoch em segundos, bid, ask)."""
+    return np.array(
+        [(int(t), bid, ask, 0.0, 0, int(t * 1000), 6, 0.0) for t, bid, ask in rows], dtype=TICK_DTYPE
+    )
+
+
 def make_rates(closes: list[float], *, start_time: int = 1_700_000_000, step_seconds: int = 3600, spread: int = 12):
     """Gera candles a partir de uma lista de fechamentos (open = fechamento anterior)."""
     rows = []
@@ -223,6 +235,7 @@ class FakeMT5:
         orders: list[Record] | None = None,
         deals: list[Record] | None = None,
         history_orders: list[Record] | None = None,
+        ticks: dict[str, np.ndarray] | None = None,
         login: int = 12345678,
         zero_tick_symbols: set[str] | None = None,
         rates_fail_times: int = 0,
@@ -249,6 +262,9 @@ class FakeMT5:
         self.orders = orders or []
         self.deals = deals or []
         self.history_orders = history_orders or []
+        self.ticks = ticks or {}
+        # Candles por (símbolo, timeframe) para copy_rates_range; sem entrada, vale `rates` do símbolo.
+        self.rates_tf: dict[tuple[str, int], np.ndarray] = {}
         self.login = login
         self.zero_tick_symbols: set[str] = set(zero_tick_symbols or ())
         self.rates_fail_times = rates_fail_times
@@ -375,7 +391,10 @@ class FakeMT5:
         self.range_calls.append((symbol, timeframe, date_from, date_to))
         if not self.initialized:
             return None
-        data = self.rates.get(symbol, np.array([], dtype=RATES_DTYPE))
+        # O MT5 real lê datetime sem fuso como horário local do Windows.
+        if date_from.tzinfo is None or date_to.tzinfo is None:
+            raise AssertionError("copy_rates_range recebeu datetime sem fuso")
+        data = self.rates_tf.get((symbol, timeframe), self.rates.get(symbol, np.array([], dtype=RATES_DTYPE)))
         lo, hi = int(date_from.timestamp()), int(date_to.timestamp())
         return data[(data["time"] >= lo) & (data["time"] <= hi)].copy()
 
@@ -404,6 +423,15 @@ class FakeMT5:
             return None
         items = self.orders if symbol is None else [o for o in self.orders if o.symbol == symbol]
         return tuple(items)
+
+    def copy_ticks_range(self, symbol: str, date_from: datetime, date_to: datetime, flags: int):
+        if not self.initialized:
+            return None
+        if date_from.tzinfo is None or date_to.tzinfo is None:
+            raise AssertionError("copy_ticks_range recebeu datetime sem fuso")
+        data = self.ticks.get(symbol, np.array([], dtype=TICK_DTYPE))
+        lo, hi = int(date_from.timestamp() * 1000), int(date_to.timestamp() * 1000)
+        return data[(data["time_msc"] >= lo) & (data["time_msc"] <= hi)].copy()
 
     def history_deals_get(self, date_from: Any = None, date_to: Any = None, *, position: int | None = None, **kwargs: Any):
         if not self.initialized:

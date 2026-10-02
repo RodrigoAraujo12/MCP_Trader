@@ -90,6 +90,24 @@ Conferido com uma venda a mercado de 0,01 BTCUSDm (stop e alvo) e uma compra lim
 - Fechamento manual pelo terminal: negócio de saída com `reason` 0 (cliente) e ordem própria sem stop/alvo. A ordem pendente cancelada ficou no histórico com `state` 2 e `position_id` 0.
 - Journal sincronizado com essa operação: entrada 85585,85, saída 85448,40, +1,38, risco inicial 1,41, R 0,98; a segunda sincronização não duplicou.
 
+## Instrumentos operados e reação a eventos (etapa C, 2026-10-02 ~04:30 UTC)
+
+| Instrumento | Símbolo | Observação |
+|---|---|---|
+| Nikkei 225 | `JP225m` | CFD, lucro em **JPY**, 1 casa decimal |
+| Ouro | `XAUUSDm` | Modo de cálculo forex, base XAU, contrato 100 |
+| Libra / Euro | `GBPUSDm`, `EURUSDm` | 5 casas |
+| Bitcoin | `BTCUSDm` | Modo de cálculo forex, contrato 1, spread ~10 USD |
+| Brent | `UKOILm` | CFD, contrato 1000 |
+| Índice do dólar | `DXYm` | CFD (modo 4), contrato 1000 |
+
+Os índices da Exness vêm com moeda base e de lucro = USD (por isso "pips" só para pares de moedas de verdade).
+
+- `copy_rates_range` e `copy_ticks_range` com datas com fuso funcionam; todos os 9 tinham M1 e ticks no Jobless Claims de 1/10, 12:30 UTC.
+- Reação medida em 5 min, em % e em vezes o movimento típico das 2 h antes: US30 +0,12% (3,8×), ouro +0,10% (2,3×), DXY −0,03% (1,7×), JP225 +0,07% (1,6×), EURUSD +0,04% (1,6×), BTC +0,09% (1,9×), GBPUSD +0,03% (1,4×), USTEC +0,03% (0,6×), UKOIL +0,04% (0,4×). Pela % o BTC parecia reagir mais que o DXY; pelo típico, os dois ficaram parecidos, e o USTEC ficou dentro do ruído. O Claims veio 5 mil acima da previsão, mas os contínuos vieram abaixo e não há como separar o efeito de cada um.
+- `contexto_mercado` às 04:40 UTC: o UKOIL não negocia na virada do dia (último preço às 21:00 UTC, primeiro candle às 00:10), por isso a variação do dia parte do preço das 21:00 e vem marcada com `desde`.
+- Spread na conta demo: praticamente fixo na divulgação (USTEC 112 pontos antes e depois; JP225 31 → 34; ouro 240 → 260; UKOIL 44 → 42). A conta real pode se comportar diferente.
+
 ## Ainda não reproduzido no terminal real
 
 - Troca de conta e perda de conexão com o servidor em execução. Estão cobertas por testes com MT5 simulado.
