@@ -69,6 +69,19 @@ O primeiro arquivo exportado tinha 150 eventos e 227 valores dos EUA, cobrindo d
 - **Feriados:** Columbus Day vem com importância `NONE` e horário 00:00 (modo `DATE`).
 - **Realizado ausente:** o PMI industrial da S&P Global (`markit-manufacturing-pmi`, 13:45 UTC) continuava sem realizado cerca de 10 h depois. O ISM das 14:00 UTC tinha realizado.
 
+## Posições e ordens pendentes (etapa B1, 2026-10-02 ~04:05 UTC)
+
+Conferido com uma venda a mercado de 0,01 BTCUSDm (stop e alvo) e uma compra limitada de 0,01 BTCUSDm (stop e alvo), abertas à mão na demo.
+
+- `positions_get()` e `orders_get()` sem itens devolvem tupla vazia, com `last_error` `(1, 'Success')`; None fica só para erro.
+- Campos da posição: `ticket, time, time_msc, time_update, time_update_msc, type, magic, identifier, reason, volume, price_open, sl, tp, price_current, swap, profit, symbol, comment, external_id`. Não há comissão.
+- Campos da ordem: `ticket, time_setup, time_setup_msc, time_done, time_done_msc, time_expiration, type, type_time, type_filling, state, magic, position_id, position_by_id, reason, volume_initial, volume_current, price_open, sl, tp, price_current, price_stoplimit, symbol, comment, external_id`.
+- `price_current` da posição de venda = ask; da compra limitada = ask (o lado que a ativa). Uma posição de compra não foi aberta; pela simetria deve ser o bid.
+- `order_calc_profit` dá perda negativa (venda até o stop: −1,41; até o alvo: +5,83) e bate com `profit` da posição (0,19 = 0,19; 1,27 = 1,27).
+- `symbol_info` diferencia maiúsculas (`USTECM` não existe); `USTECm`, `USTEC` e `US30m` resolvem certo.
+- BTCUSDm é classificado como forex pelo `trade_calc_mode`: aparece "pips" igual aos pontos. Não afeta os índices.
+- O relatório `posicoes` conferiu à mão: distâncias, resultado no stop/alvo, relação alvo/stop, tempo aberta e totais.
+
 ## Ainda não reproduzido no terminal real
 
 - Troca de conta e perda de conexão com o servidor em execução. Estão cobertas por testes com MT5 simulado.

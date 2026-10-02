@@ -8,6 +8,7 @@ from trading_mcp.risk import (
     loss_per_lot_from_ticks,
     pip_size,
     position_size,
+    profit_from_ticks,
     round_to_step,
 )
 
@@ -184,3 +185,19 @@ def test_end_to_end_eurusd_20_pips():
     r = position_size(5_000, 1, loss, 0.01, 100, 0.01)  # alvo 50 / 200 = 0.25
     assert r.lots == 0.25
     assert r.risk_actual == pytest.approx(50)
+
+
+@pytest.mark.parametrize(
+    "side,close,expected",
+    [("buy", 1.09800, -20.0), ("buy", 1.10200, 20.0), ("sell", 1.09800, 20.0), ("sell", 1.10200, -20.0)],
+)
+def test_profit_from_ticks_is_signed(side, close, expected):
+    # 200 pontos x 1 USD x 0,1 lote.
+    assert profit_from_ticks(side, 0.1, 1.10000, close, 0.00001, 1.0) == pytest.approx(expected)
+
+
+def test_profit_from_ticks_rejects_bad_input():
+    with pytest.raises(ValueError):
+        profit_from_ticks("compra", 0.1, 1.1, 1.2, 0.00001, 1.0)
+    with pytest.raises(ValueError):
+        profit_from_ticks("buy", 0.1, 1.1, 1.2, 0.0, 1.0)

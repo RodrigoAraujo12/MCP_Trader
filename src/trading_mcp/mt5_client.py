@@ -49,6 +49,7 @@ _ALLOWED_CALLS = frozenset(
         "order_calc_profit",
         "order_calc_margin",
         "positions_get",
+        "orders_get",
     }
 )
 
@@ -66,6 +67,24 @@ _FUTURE_TOLERANCE_S = 60.0
 _MAX_LOOKBACK = timedelta(days=7)
 
 ACCOUNT_MODES = {"ACCOUNT_TRADE_MODE_DEMO": "demo", "ACCOUNT_TRADE_MODE_CONTEST": "concurso", "ACCOUNT_TRADE_MODE_REAL": "real"}
+# Tipo de ordem -> (lado, descrição). Ordens a mercado só aparecem em orders_get enquanto são processadas.
+ORDER_KINDS: dict[str, tuple[str | None, str]] = {
+    "ORDER_TYPE_BUY": ("buy", "compra a mercado (em processamento)"),
+    "ORDER_TYPE_SELL": ("sell", "venda a mercado (em processamento)"),
+    "ORDER_TYPE_BUY_LIMIT": ("buy", "compra limitada"),
+    "ORDER_TYPE_SELL_LIMIT": ("sell", "venda limitada"),
+    "ORDER_TYPE_BUY_STOP": ("buy", "compra stop"),
+    "ORDER_TYPE_SELL_STOP": ("sell", "venda stop"),
+    "ORDER_TYPE_BUY_STOP_LIMIT": ("buy", "compra stop limitada"),
+    "ORDER_TYPE_SELL_STOP_LIMIT": ("sell", "venda stop limitada"),
+    "ORDER_TYPE_CLOSE_BY": (None, "fechamento por posição oposta (em processamento)"),
+}
+ORDER_TIMES = {
+    "ORDER_TIME_GTC": "até cancelar",
+    "ORDER_TIME_DAY": "até o fim do dia",
+    "ORDER_TIME_SPECIFIED": "até a data de expiração",
+    "ORDER_TIME_SPECIFIED_DAY": "até o fim do dia da expiração",
+}
 
 
 class MT5Error(Exception):
@@ -178,6 +197,10 @@ class MT5Client:
             self._call("shutdown")
         except MT5Error:
             pass
+
+    def now_utc(self) -> datetime:
+        """Relógio UTC usado pelo cliente (injetável nos testes)."""
+        return self._now_utc()
 
     @property
     def account_pinned(self) -> bool:
@@ -686,9 +709,19 @@ class MT5Client:
                 raise MT5Error(f"O terminal não informou a pasta de dados: {self._last_error()}")
             return str(path)
 
+    @staticmethod
+    def _epoch_ms(record: Any, field: str) -> datetime:
+        """Horário de um registro do MT5, com milissegundos quando houver (``<field>_msc``)."""
+        msc = getattr(record, f"{field}_msc", 0) or 0
+        return tempo.from_epoch(msc / 1000 if msc else getattr(record, field))
+
     @_guard
-    def positions(self) -> list[dict]:
-        """Posições abertas."""
+    def open_positions(self) -> list[dict]:
+        """Posições abertas com valores brutos: ``lado`` buy/sell, ``abertura`` em datetime UTC.
+
+        ``preco_atual`` é o preço de fechamento da posição (bid na compra, ask na venda); ``lucro``
+        não inclui swap nem comissão. Stop/alvo ausentes saem como None (o MT5 usa 0).
+        """
         with self._lock:
             self.ensure_connected()
             mt5 = self._module()
@@ -699,16 +732,107 @@ class MT5Client:
             return [
                 {
                     "ticket": p.ticket,
+                    # Identificador da posição = ticket da ordem que a abriu.
+                    "identificador": getattr(p, "identifier", p.ticket),
                     "simbolo": p.symbol,
-                    "tipo": "compra" if p.type == buy else "venda",
+                    "lado": "buy" if p.type == buy else "sell",
                     "volume": p.volume,
                     "preco_abertura": p.price_open,
                     "preco_atual": p.price_current,
-                    "stop_loss": p.sl,
-                    "take_profit": p.tp,
+                    "stop_loss": p.sl or None,
+                    "take_profit": p.tp or None,
                     "lucro": p.profit,
                     "swap": p.swap,
-                    "abertura": tempo.exibicao(tempo.from_epoch(p.time)),
+                    "abertura": self._epoch_ms(p, "time"),
                 }
                 for p in items
             ]
+
+    @_guard
+    def positions(self) -> list[dict]:
+        """Posições abertas (resumo para exibição)."""
+        return [
+            {
+                "ticket": p["ticket"],
+                "simbolo": p["simbolo"],
+                "tipo": "compra" if p["lado"] == "buy" else "venda",
+                "volume": p["volume"],
+                "preco_abertura": p["preco_abertura"],
+                "preco_atual": p["preco_atual"],
+                "stop_loss": p["stop_loss"] or 0.0,
+                "take_profit": p["take_profit"] or 0.0,
+                "lucro": p["lucro"],
+                "swap": p["swap"],
+                "abertura": tempo.exibicao(p["abertura"]),
+            }
+            for p in self.open_positions()
+        ]
+
+    @_guard
+    def pending_orders(self) -> list[dict]:
+        """Ordens ativas (pendentes ou em processamento) com valores brutos.
+
+        ``preco`` é o preço de ativação; na stop limitada, ``preco_limite`` é o preço da ordem limitada
+        colocada quando o stop é atingido. ``lado`` é None para ordens que fecham posição (fechamento por
+        oposta ou ordem a mercado ligada a uma posição). ``preco_atual`` é None sem cotação.
+        """
+        with self._lock:
+            self.ensure_connected()
+            mt5 = self._module()
+            items = self._call("orders_get")
+            if items is None:
+                raise MT5Error(f"Não foi possível ler as ordens pendentes: {self._last_error()}")
+            kinds = {getattr(mt5, const): kind for const, kind in ORDER_KINDS.items() if hasattr(mt5, const)}
+            times = {getattr(mt5, const): text for const, text in ORDER_TIMES.items() if hasattr(mt5, const)}
+            market = {mt5.ORDER_TYPE_BUY, mt5.ORDER_TYPE_SELL}
+            out: list[dict] = []
+            for o in items:
+                side, kind = kinds.get(o.type, (None, f"tipo {o.type} desconhecido"))
+                position_id = getattr(o, "position_id", 0) or 0
+                if o.type in market and position_id:
+                    side, kind = None, f"fechamento da posição {position_id} (em processamento)"
+                expiration = getattr(o, "time_expiration", 0) or 0
+                out.append(
+                    {
+                        "ticket": o.ticket,
+                        "simbolo": o.symbol,
+                        "lado": side,
+                        "tipo": kind,
+                        "volume_inicial": getattr(o, "volume_initial", o.volume_current),
+                        "volume_atual": o.volume_current,
+                        "preco": o.price_open,
+                        "preco_limite": getattr(o, "price_stoplimit", 0.0) or None,
+                        "stop_loss": o.sl or None,
+                        "take_profit": o.tp or None,
+                        "preco_atual": o.price_current or None,
+                        "colocada": self._epoch_ms(o, "time_setup"),
+                        "validade": times.get(getattr(o, "type_time", None), "não informada"),
+                        "expira": tempo.from_epoch(expiration) if expiration else None,
+                    }
+                )
+            return out
+
+    @_guard
+    def profit(self, symbol: str, side: str, volume: float, price_open: float, price_close: float) -> float:
+        """Resultado (moeda da conta) de ``volume`` lotes entre dois preços; negativo = perda."""
+        side_key = (side or "").strip().lower() if isinstance(side, str) else ""
+        if side_key not in ("buy", "sell"):
+            raise ValueError(f"side deve ser 'buy' ou 'sell', recebido: {side!r}.")
+        if price_open == price_close or volume == 0:
+            return 0.0
+        with self._lock:
+            resolved = self.resolve_symbol(symbol)
+            mt5 = self._module()
+            action = mt5.ORDER_TYPE_BUY if side_key == "buy" else mt5.ORDER_TYPE_SELL
+            value = self._call("order_calc_profit", action, resolved, float(volume), float(price_open), float(price_close))
+            if value:
+                return float(value)
+            info = self._info(resolved)
+        log.info("order_calc_profit indisponível para %s; usando tick_value", resolved)
+        gain = (price_close > price_open) == (side_key == "buy")
+        field = "trade_tick_value_profit" if gain else "trade_tick_value_loss"
+        tick_value = getattr(info, field, 0.0) or info.trade_tick_value
+        try:
+            return risk.profit_from_ticks(side_key, volume, price_open, price_close, info.trade_tick_size, tick_value)
+        except ValueError as exc:
+            raise MT5Error(f"Sem valor do tick para calcular o resultado em {resolved}: {exc}") from exc

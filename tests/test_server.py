@@ -9,14 +9,24 @@ from typing import Any
 import pytest
 from mcp import Client
 
-from fake_mt5 import ACCOUNT_TRADE_MODE_REAL, SYMBOL_CALC_MODE_CFD, FakeMT5, make_rates, make_symbol
+from fake_mt5 import (
+    ACCOUNT_TRADE_MODE_REAL,
+    ORDER_TYPE_BUY_STOP,
+    SYMBOL_CALC_MODE_CFD,
+    FakeMT5,
+    make_order,
+    make_position,
+    make_rates,
+    make_symbol,
+)
 from trading_mcp.config import Settings
 from trading_mcp.mt5_client import MT5Client
 from trading_mcp.sec_edgar import SecEdgarError
 from trading_mcp.server import create_server
 
 EXPECTED_TOOLS = {
-    "cotacao", "historico", "indicadores", "tamanho_posicao", "info_conta", "simbolos", "calendario", "fundamentos"
+    "cotacao", "historico", "indicadores", "tamanho_posicao", "info_conta", "posicoes", "simbolos", "calendario",
+    "fundamentos",
 }
 
 
@@ -314,6 +324,24 @@ async def test_info_conta_shows_terminal_trading_locks() -> None:
         data = _payload(await client.call_tool("info_conta", {}))
     assert data["terminal"]["negociacao_via_python_desativada"] is True
     assert data["terminal"]["algo_trading_ativo"] is False
+
+
+@pytest.mark.anyio
+async def test_posicoes_reports_positions_and_pending_orders() -> None:
+    fake = _fake_mt5(
+        positions=[make_position(7, "EURUSDm", "buy", 0.1, 1.098, 1.1, sl=1.096, tp=1.104, profit=20.0)],
+        orders=[make_order(8, "EURUSDm", ORDER_TYPE_BUY_STOP, 0.2, 1.102, 1.10012, sl=1.1)],
+    )
+    async with Client(_server(fake)) as client:
+        data = _payload(await client.call_tool("posicoes", {}))
+        only_usdjpy = _payload(await client.call_tool("posicoes", {"simbolo": "USDJPY", "incluir_pendentes": False}))
+    pos = data["posicoes"][0]
+    assert pos["stop"]["resultado_se_atingido"] == pytest.approx(-20.0)
+    assert pos["alvo"]["resultado_se_atingido"] == pytest.approx(60.0)
+    assert pos["cotacao"]["estado"] == "atual"
+    assert data["pendentes"][0]["tipo"] == "compra stop"
+    assert data["totais_pendentes"]["perda_nos_stops_se_executadas"] == pytest.approx(40.0)
+    assert only_usdjpy["posicoes"] == [] and "pendentes" not in only_usdjpy
 
 
 @pytest.mark.anyio

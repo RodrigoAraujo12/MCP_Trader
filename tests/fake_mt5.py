@@ -24,6 +24,9 @@ TIMEFRAME_H6, TIMEFRAME_H8, TIMEFRAME_H12 = 16390, 16392, 16396
 TIMEFRAME_D1, TIMEFRAME_W1, TIMEFRAME_MN1 = 16408, 32769, 49153
 
 ORDER_TYPE_BUY, ORDER_TYPE_SELL = 0, 1
+ORDER_TYPE_BUY_LIMIT, ORDER_TYPE_SELL_LIMIT, ORDER_TYPE_BUY_STOP, ORDER_TYPE_SELL_STOP = 2, 3, 4, 5
+ORDER_TYPE_BUY_STOP_LIMIT, ORDER_TYPE_SELL_STOP_LIMIT, ORDER_TYPE_CLOSE_BY = 6, 7, 8
+ORDER_TIME_GTC, ORDER_TIME_DAY, ORDER_TIME_SPECIFIED, ORDER_TIME_SPECIFIED_DAY = 0, 1, 2, 3
 POSITION_TYPE_BUY, POSITION_TYPE_SELL = 0, 1
 
 ACCOUNT_TRADE_MODE_DEMO, ACCOUNT_TRADE_MODE_CONTEST, ACCOUNT_TRADE_MODE_REAL = 0, 1, 2
@@ -101,6 +104,57 @@ def make_symbol(
     )
 
 
+def make_position(
+    ticket: int,
+    symbol: str,
+    side: str,
+    volume: float,
+    price_open: float,
+    price_current: float,
+    *,
+    sl: float = 0.0,
+    tp: float = 0.0,
+    profit: float = 0.0,
+    swap: float = 0.0,
+    time: int = 1_700_000_000,
+) -> Record:
+    """Posição como a de positions_get (o MT5 usa 0 para stop/alvo ausentes)."""
+    return Record(
+        ticket=ticket, time=time, time_msc=time * 1000, time_update=time, time_update_msc=time * 1000,
+        type=POSITION_TYPE_BUY if side == "buy" else POSITION_TYPE_SELL, magic=0, identifier=ticket, reason=0,
+        volume=volume, price_open=price_open, sl=sl, tp=tp, price_current=price_current, swap=swap,
+        profit=profit, symbol=symbol, comment="", external_id="",
+    )
+
+
+def make_order(
+    ticket: int,
+    symbol: str,
+    order_type: int,
+    volume: float,
+    price_open: float,
+    price_current: float,
+    *,
+    sl: float = 0.0,
+    tp: float = 0.0,
+    price_stoplimit: float = 0.0,
+    volume_initial: float | None = None,
+    type_time: int = ORDER_TIME_GTC,
+    time_expiration: int = 0,
+    time_setup: int = 1_700_000_000,
+    position_id: int = 0,
+) -> Record:
+    """Ordem como a de orders_get."""
+    return Record(
+        ticket=ticket, time_setup=time_setup, time_setup_msc=time_setup * 1000, time_done=0, time_done_msc=0,
+        time_expiration=time_expiration, type=order_type, type_time=type_time, type_filling=2, state=1, magic=0,
+        position_id=position_id, position_by_id=0, reason=0,
+        volume_initial=volume if volume_initial is None else volume_initial, volume_current=volume,
+        price_open=price_open, sl=sl, tp=tp, price_current=price_current, price_stoplimit=price_stoplimit,
+        symbol=symbol, comment="", external_id="",
+    )
+
+
 def make_rates(closes: list[float], *, start_time: int = 1_700_000_000, step_seconds: int = 3600, spread: int = 12):
     """Gera candles a partir de uma lista de fechamentos (open = fechamento anterior)."""
     rows = []
@@ -127,6 +181,7 @@ class FakeMT5:
         initialize_ok: bool = True,
         connected: bool = True,
         positions: list[Record] | None = None,
+        orders: list[Record] | None = None,
         login: int = 12345678,
         zero_tick_symbols: set[str] | None = None,
         rates_fail_times: int = 0,
@@ -150,6 +205,7 @@ class FakeMT5:
         self.initialize_ok = initialize_ok
         self.connected = connected
         self.positions = positions or []
+        self.orders = orders or []
         self.login = login
         self.zero_tick_symbols: set[str] = set(zero_tick_symbols or ())
         self.rates_fail_times = rates_fail_times
@@ -298,6 +354,12 @@ class FakeMT5:
         if not self.initialized:
             return None
         items = self.positions if symbol is None else [p for p in self.positions if p.symbol == symbol]
+        return tuple(items)
+
+    def orders_get(self, symbol: str | None = None, **kwargs: Any):
+        if not self.initialized:
+            return None
+        items = self.orders if symbol is None else [o for o in self.orders if o.symbol == symbol]
         return tuple(items)
 
     # --- proibido na fase 1 ---------------------------------------------

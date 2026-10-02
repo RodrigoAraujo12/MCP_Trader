@@ -78,6 +78,7 @@ Use uma instalação **separada** do MT5, logada **só** na conta demo, e aponte
 | `indicadores` | RSI, MACD, EMA, SMA, ATR, Bollinger | `simbolo`, `lista` (padrão: RSI(14), MACD(12,26,9), EMA 20/50, ATR(14)), `timeframe`, `incluir_candle_atual` |
 | `tamanho_posicao` | Lote para arriscar X% do saldo | `simbolo`, `entrada`, `stop`, `risco_percentual` (padrão 1%), `saldo` (padrão: saldo da conta) |
 | `info_conta` | Saldo, margem, posições abertas e travas de negociação do terminal | — |
+| `posicoes` | Posições abertas e ordens pendentes: estado da cotação, distância até stop e alvo, resultado se forem atingidos, duração e exposição por símbolo | `simbolo` (vazio = todos), `incluir_pendentes` (padrão: sim) |
 | `simbolos` | Busca símbolos disponíveis na conta | `busca` (ex.: USD, Apple), `limite` (1–200, padrão 30) |
 | `calendario` | Calendário econômico dos EUA: horário (UTC/SP/NY), importância, realizado, previsão, anterior, anterior revisado e surpresa | `horas_a_frente` (padrão 24), `horas_atras` (padrão 2), `importancia_minima`, `busca` (ex.: CPI, NFP, claims, FOMC) |
 | `fundamentos` | Fundamentos da SEC EDGAR (receita, lucro, LPA, ROE, margem) | `ticker` (ex.: AAPL, MSFT, BRK.B) |
@@ -88,6 +89,8 @@ Use uma instalação **separada** do MT5, logada **só** na conta demo, e aponte
 
 **Indicadores**: seguem as convenções do TradingView (EMA, RSI e ATR com semente SMA, suavização de Wilder, Bollinger com desvio padrão populacional). Com o candle atual incluído, os valores mudam até ele fechar. O ATR e o MACD nativos do MT5 usam médias simples, então podem diferir levemente do gráfico do MT5.
 
+**Posições**: para cada posição, `stop.resultado_se_atingido` vai do preço de entrada até o stop atual (negativo = perda; positivo = lucro protegido) e `variacao_desde_agora` vai do preço atual até ele; o mesmo para o alvo. A `situacao` do stop é `com_risco`, `no_preco_de_entrada`, `lucro_protegido` ou `sem_stop`. Distância positiva = nível ainda não atingido; `ultrapassado` marca um stop ou alvo que o preço já passou (gap ou cotação parada), e aí a variação desde agora fica nula. `pontos` são pontos do MT5 (no USTECm, 0,01): para índices, a distância em pontos do índice é o campo `preco`. Os totais somam posição por posição, sem compensar posições opostas (a conta é hedging): `perda_nos_stops` (valor positivo) só soma stops com risco e não inclui posições sem stop; se faltar algum valor, os totais saem nulos em vez de parciais. Ordens pendentes trazem o resultado se forem executadas e o stop for atingido (na stop limitada, a entrada é o preço da limitada). São medições sobre o stop **atual**: o risco inicial e o resultado em R ficam para o journal (B3). Comissão não incluída; swap à parte.
+
 **Tamanho de posição**: a direção é deduzida (stop abaixo da entrada = compra). O resultado traz o risco com o lote arredondado, o efeito do spread atual nas compras (`risco_com_spread`) e a margem estimada. Ele recusa stop menor que o tick do símbolo e avisa quando o spread consome boa parte do stop ou quando a margem passa da margem livre. Comissão e swap não estão incluídos: em contas Raw Spread/Zero, some a comissão por lote.
 
 ## Exemplos de perguntas
@@ -96,6 +99,7 @@ Use uma instalação **separada** do MT5, logada **só** na conta demo, e aponte
 - "Tem evento importante dos EUA nos próximos 30 minutos?"
 - "O Jobless Claims saiu? Compare realizado, previsão e anterior."
 - "Qual é o RSI e o MACD do EURUSD no H4?"
+- "Quanto perco se os stops das minhas posições forem atingidos? E quanto falta até cada stop?"
 - "Quantos lotes devo usar para arriscar 1% com entrada 1.0850 e stop 1.0820 no EURUSD?"
 - "Mostre os fundamentos da AAPL: receita, lucro, margem e ROE do último ano."
 - "Qual foi a variação percentual do XAUUSD nos últimos 50 candles em D1?"
@@ -205,6 +209,7 @@ mql5/Services/
 - O estado da cotação deduz a sessão pela semana anterior: num feriado, uma cotação parada aparece como `atrasado`; se o feriado foi na semana anterior, uma parada real hoje aparece como `mercado_fechado_provavel`. Na semana da mudança do horário de verão, a pausa diária pode ser classificada errada por 1 hora.
 - O fuso UTC do servidor precisa ser reconferido depois de 1/11/2026 (fim do horário de verão dos EUA).
 - Calendário: depende do terminal aberto com o serviço rodando. Alguns indicadores ficam sem realizado no calendário do MT5 (em 2026-10-01, o PMI industrial da S&P Global continuava sem valor horas depois da divulgação). A latência da fonte ainda não foi medida numa divulgação real.
+- Posições (`posicoes`): conferido no terminal real em 2026-10-02 com uma venda e uma compra limitada (veja `docs/`); uma posição de compra ainda não foi aberta no terminal real. Comissão não aparece (fica nos negócios do histórico).
 - Para alguns bancos e empresas com duas classes de ações, `caixa` e `acoes_em_circulacao` vêm vazios, com uma observação explicando.
 
 ## Roadmap
@@ -212,7 +217,7 @@ mql5/Services/
 Revisado em 2026-10-01. Tudo continua somente leitura até a etapa F.
 
 - **A** (feito): base validada no MT5 real (identidade da conta, horários em UTC, estado da cotação).
-- **B**: calendário econômico (feito: B2), consulta de posições com distâncias e risco até o stop (B1) e journal manual em SQLite (B3).
+- **B**: calendário econômico (feito: B2), consulta de posições com distâncias e risco até o stop (feito: B1) e journal manual em SQLite (B3).
 - **C**: reação observada a eventos (janelas de 1/5/15 min alinhadas em UTC) e contexto entre ativos; notícias só depois de medir a latência das fontes gratuitas.
 - **D**: backtest de um único setup definido por regras objetivas.
 - **E**: propostas de operação com limites rígidos e aprovação humana fora do chat, ainda sem envio.

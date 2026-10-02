@@ -17,7 +17,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import ToolAnnotations
 from pydantic import Field
 
-from trading_mcp import indicators, risk, tempo
+from trading_mcp import indicators, posicoes as posicoes_report, risk, tempo
 from trading_mcp.calendario import CalendarError, EconomicCalendar
 from trading_mcp.config import Settings, load_settings
 from trading_mcp.mt5_client import MT5Client, MT5Error
@@ -51,6 +51,12 @@ Regras de uso:
 - Indicadores seguem a convenção do TradingView. O ATR e o MACD nativos do MT5 usam médias simples
   (ATR = média simples do true range; linha de sinal do MACD = média simples), então podem diferir do gráfico do MT5.
 - `tamanho_posicao` não inclui comissão nem swap; contas Raw Spread/Zero cobram comissão por lote.
+- Posições e ordens pendentes: use `posicoes`. `resultado_se_atingido` vai do preço de entrada até o stop
+  ou alvo atual (negativo = perda); `variacao_desde_agora` vai do preço atual até ele. `distancia_do_preco_atual`
+  positiva = nível ainda não atingido (`ultrapassado` = o preço já passou dele). Nos totais, `perda_nos_stops`
+  é o tamanho da perda (valor positivo). `pontos` são pontos do MT5; nos índices, cite a distância em `preco`.
+  Lucro protegido não é garantido: em gaps o stop executa pior. Só trate preço atual e lucro aberto como de
+  agora quando a `cotacao` do item estiver "atual". Os valores são medições: não dizem se o risco é adequado.
 - Símbolos podem ser informados sem sufixo (EURUSD); o servidor resolve para o nome da conta (ex.: EURUSDm).
 - Calendário: identifique a medida pelo `codigo`/`descricao`/`medida` (os nomes traduzidos podem estar
   errados). Compare realizado e `previsao` na mesma unidade (a `surpresa` já vem calculada). A previsão é
@@ -364,6 +370,19 @@ def create_server(
             if warnings:
                 result["avisos"] = warnings
             return result
+
+    @server.tool(annotations=READ_ONLY)
+    def posicoes(
+        simbolo: Annotated[str, Field(description="Filtrar por símbolo, ex.: USTEC; vazio = todos")] = "",
+        incluir_pendentes: Annotated[bool, Field(description="Incluir ordens pendentes")] = True,
+    ) -> dict[str, Any]:
+        """Posições abertas e ordens pendentes: preço atual e estado da cotação, distância até stop e alvo,
+        resultado se forem atingidos (moeda da conta e % do saldo), duração e exposição por símbolo.
+
+        Mede o stop e o alvo como estão agora; não avalia se o risco é adequado.
+        """
+        with _tool_errors():
+            return posicoes_report.build(mt5, simbolo, incluir_pendentes)
 
     @server.tool(annotations=READ_ONLY)
     def simbolos(

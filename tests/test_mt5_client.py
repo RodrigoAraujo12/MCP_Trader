@@ -423,6 +423,8 @@ def test_positions_mapping():
         "abertura": {"utc": "2023-11-14T22:13:20Z", "sao_paulo": "2023-11-14 19:13:20",
                      "nova_york": "2023-11-14 17:13:20"},
     }
+    # Sem stop/alvo, o resumo de info_conta continua mostrando 0.0, como o MT5.
+    assert out[1]["stop_loss"] == 0.0 and out[1]["take_profit"] == 0.0
 
 
 def test_positions_empty():
@@ -602,6 +604,7 @@ def test_proxy_blocks_order_send_and_other_writes():
     with pytest.raises(MT5Error, match="order_send"):
         mod.order_send({})
     assert mod.TIMEFRAME_H1 == fm.TIMEFRAME_H1  # constantes liberadas
+    assert callable(mod.orders_get)  # leitura de ordens pendentes liberada
 
 
 # ---------------------------------------------------------------- identidade da conta

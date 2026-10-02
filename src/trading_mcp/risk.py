@@ -54,6 +54,23 @@ def loss_per_lot_from_ticks(entry: float, stop: float, tick_size: float, tick_va
     return float(distance / _dec(tick_size) * _dec(tick_value))
 
 
+def profit_from_ticks(
+    side: str, volume: float, price_open: float, price_close: float, tick_size: float, tick_value: float
+) -> float:
+    """Resultado (moeda da conta) de ``volume`` lotes entre dois preços, via tick_size/tick_value.
+
+    Negativo = perda. ``side`` é "buy" ou "sell".
+    """
+    if side not in ("buy", "sell"):
+        raise ValueError(f"side deve ser 'buy' ou 'sell', recebido: {side!r}.")
+    if tick_size <= 0 or tick_value <= 0:
+        raise ValueError("tick_size e tick_value devem ser maiores que zero.")
+    move = _dec(price_close) - _dec(price_open)
+    if side == "sell":
+        move = -move
+    return float(move / _dec(tick_size) * _dec(tick_value) * _dec(volume))
+
+
 def position_size(
     balance: float,
     risk_percent: float,
