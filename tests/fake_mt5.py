@@ -263,7 +263,7 @@ class FakeMT5:
         self.deals = deals or []
         self.history_orders = history_orders or []
         self.ticks = ticks or {}
-        # Candles por (símbolo, timeframe) para copy_rates_range; sem entrada, vale `rates` do símbolo.
+        # Candles por (símbolo, timeframe) para todas as leituras de candles; sem entrada, vale `rates` do símbolo.
         self.rates_tf: dict[tuple[str, int], np.ndarray] = {}
         self.login = login
         self.zero_tick_symbols: set[str] = set(zero_tick_symbols or ())
@@ -279,6 +279,7 @@ class FakeMT5:
         self.tick_age_s: dict[str, float] = dict(tick_age_s or {})
         self.rates_calls = 0
         self.range_calls: list[tuple[Any, ...]] = []
+        self.from_calls: list[tuple[Any, ...]] = []
         self.terminal_polls = 0
         self.shutdown_calls = 0
         self.initialized = False
@@ -374,18 +375,28 @@ class FakeMT5:
         if self.rates_calls <= self.rates_fail_times:
             self._last_error = (-2, "Terminal: history not synchronized yet")
             return None
-        if not self.initialized or symbol not in self.rates:
+        if not self.initialized or (symbol not in self.rates and (symbol, timeframe) not in self.rates_tf):
             self._last_error = (-4, "Terminal: Not found")
             return None
         if count >= self.maxbars:  # como no terminal real: pedir maxbars ou mais falha
             self._last_error = (-2, "Terminal: Invalid params")
             return None
-        data = self.rates[symbol]
+        data = self.rates_tf.get((symbol, timeframe), self.rates.get(symbol))
         end = len(data) - start_pos
         if end <= 0:
             return np.array([], dtype=RATES_DTYPE)
         begin = max(0, end - count)
         return data[begin:end].copy()
+
+    def copy_rates_from(self, symbol: str, timeframe: int, date_from: datetime, count: int):
+        """Como no terminal real: os ``count`` candles que abriram até ``date_from``, inclusive o que estava aberto."""
+        self.from_calls.append((symbol, timeframe, date_from, count))
+        if not self.initialized:
+            return None
+        if date_from.tzinfo is None:
+            raise AssertionError("copy_rates_from recebeu datetime sem fuso")
+        data = self.rates_tf.get((symbol, timeframe), self.rates.get(symbol, np.array([], dtype=RATES_DTYPE)))
+        return data[data["time"] <= int(date_from.timestamp())][-count:].copy()
 
     def copy_rates_range(self, symbol: str, timeframe: int, date_from: datetime, date_to: datetime):
         self.range_calls.append((symbol, timeframe, date_from, date_to))

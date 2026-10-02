@@ -5,6 +5,10 @@ que só o usuário sabe (setup, motivo, observações) e o stop inicial, que def
 o resultado em R. Uma operação é uma posição do MT5; cada execução dela é um negócio. Estatísticas
 são calculadas aqui, de forma determinística.
 
+O contexto SMC da entrada (``contexto_entrada``) é medido com os candles fechados antes da primeira
+entrada, depois de gravados os fatos, e serve para agrupar as estatísticas; nada do que o preço fez depois
+da entrada é medido.
+
 Banco: o esquema é preparado numa transação própria; gravações usam BEGIN IMMEDIATE (a trava de
 escrita vale desde a leitura); o trabalho no MT5 e no calendário é feito antes de abrir a transação.
 """
@@ -13,7 +17,9 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import sqlite3
+import time
 from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
@@ -21,11 +27,13 @@ from pathlib import Path
 from statistics import mean
 from typing import Any
 
-from trading_mcp import tempo
+from trading_mcp import contexto_entrada, tempo
 from trading_mcp.calendario import CalendarError, EconomicCalendar
 from trading_mcp.mt5_client import MT5Client, MT5Error
 
-SCHEMA_VERSION = 2
+logger = logging.getLogger(__name__)
+
+SCHEMA_VERSION = 3
 # Operação "com notícia": evento dos EUA de importância alta de 30 min antes da entrada até o fechamento.
 NEWS_BEFORE = timedelta(minutes=30)
 NEWS_IMPORTANCE = "alta"
@@ -36,6 +44,11 @@ _VOLUME_EPS = 1e-6
 _SERVICE_REASONS = ("rolagem", "desdobramento")
 _STOP_SOURCES = ("ordem_de_abertura", "informado", "observado")
 _EMPTY = "O journal ainda está vazio: rode `journal_sincronizar` para importar as operações do MT5."
+# Contexto das entradas só começa a ser medido até este tempo desde o início da sincronização (o Claude Desktop
+# desiste de uma tool em ~60 s; cada medição leva ~0,6 s); o que faltar é medido nas próximas.
+CONTEXT_BUDGET_S = 30.0
+# Mede o contexto de uma entrada: (símbolo, direção 'compra'/'venda', horário UTC, preço) -> dict com "versao".
+EntryContext = Callable[[str, str, datetime, float], dict[str, Any]]
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (chave TEXT PRIMARY KEY, valor TEXT NOT NULL);
@@ -71,6 +84,8 @@ CREATE TABLE IF NOT EXISTS operacoes (
     noticia_fonte TEXT,
     noticias TEXT,
     noticia_ate_utc TEXT,
+    contexto_entrada TEXT,
+    contexto_versao INTEGER,
     setup TEXT,
     tags TEXT,
     motivo TEXT,
@@ -100,7 +115,7 @@ CREATE TABLE IF NOT EXISTS negocios (
 );
 """
 # Colunas acrescentadas depois da versão 1 (migração com ALTER TABLE).
-_ADDED_COLUMNS = {"noticia_ate_utc": "TEXT"}
+_ADDED_COLUMNS = {"noticia_ate_utc": "TEXT", "contexto_entrada": "TEXT", "contexto_versao": "INTEGER"}
 
 _STATS_NOTES = [
     "Só operações fechadas entram nas estatísticas.",
@@ -110,6 +125,10 @@ _STATS_NOTES = [
     "fica fora das médias em R.",
     "Notícia = evento dos EUA de importância alta entre 30 min antes da entrada e o fechamento, pelo calendário "
     "do MT5; 'desconhecido' quando o calendário não cobria a operação na sincronização.",
+    "por_contexto: o contexto SMC na hora da primeira entrada (só candles já fechados), a favor ou contra a direção "
+    "da operação; sem_dados = timeframe sem histórico no terminal. Cada grupo é uma leitura isolada: grupos "
+    "pequenos não provam nada.",
+    "por_tag: uma operação com várias tags conta em cada uma.",
 ]
 
 
@@ -234,10 +253,13 @@ def _stats(rows: list[dict]) -> dict[str, Any]:
     }
 
 
-def _group(rows: list[dict], key: Callable[[dict], str]) -> list[dict[str, Any]]:
+def _group(rows: list[dict], key: Callable[[dict], str | list[str]]) -> list[dict[str, Any]]:
+    """Estatísticas por grupo; ``key`` pode devolver vários grupos (a operação conta em cada um)."""
     groups: dict[str, list[dict]] = {}
     for r in rows:
-        groups.setdefault(key(r), []).append(r)
+        names = key(r)
+        for name in [names] if isinstance(names, str) else names:
+            groups.setdefault(name, []).append(r)
     out = []
     for name, items in groups.items():
         s = _stats(items)
@@ -277,12 +299,21 @@ class Journal:
         mt5: MT5Client,
         calendar: EconomicCalendar | None = None,
         now_utc: Callable[[], datetime] | None = None,
+        *,
+        entry_context: EntryContext | None = None,
+        context_version: int = 0,
+        monotonic: Callable[[], float] = time.monotonic,
+        context_budget_s: float = CONTEXT_BUDGET_S,
     ) -> None:
         self._path = Path(path)
         self._export_dir = Path(export_dir)
         self._mt5 = mt5
         self._calendar = calendar
         self._now = now_utc or mt5.now_utc
+        self._entry_context = entry_context
+        self._context_version = context_version
+        self._monotonic = monotonic
+        self._context_budget = context_budget_s
 
     # ------------------------------------------------------------------ banco
     def _prepare(self, conn: sqlite3.Connection, write: bool) -> None:
@@ -476,6 +507,7 @@ class Journal:
         """Importa do MT5 as posições com negócios nos últimos ``days`` dias e as posições abertas."""
         if not 0 < days <= 366:
             raise ValueError("dias deve estar entre 0 e 366.")
+        started = self._monotonic()
         account = self._mt5.account()
         login, server = account["login"], account["servidor"]
         now = self._now()
@@ -600,6 +632,9 @@ class Journal:
                 f"SELECT COUNT(*) FROM operacoes WHERE {scope} AND status != 'fechada'", (login, server)
             ).fetchone()[0]
 
+        # 4) Contexto SMC das entradas, depois dos fatos gravados (o MT5 é lido fora da transação).
+        contexts = self._fill_contexts(login, server, started, warnings) if self._entry_context is not None else None
+
         result: dict[str, Any] = {
             "conta": {"login": login, "servidor": server, "tipo_conta": account["tipo_conta"]},
             "periodo": {"de": tempo.exibicao(start), "ate": tempo.exibicao(now)},
@@ -613,6 +648,8 @@ class Journal:
             ],
             "banco": str(self._path),
         }
+        if contexts is not None:
+            result["contexto_entrada"] = contexts
         if missing_count:
             shown = f" (mostrando {len(missing)})" if missing_count > len(missing) else ""
             warnings.append(
@@ -627,6 +664,64 @@ class Journal:
         if warnings:
             result["avisos"] = warnings
         return result
+
+    def _fill_contexts(self, login: int, server: str, started: float, warnings: list[str]) -> dict[str, int]:
+        """Mede o contexto das entradas sem contexto (ou de uma versão anterior), das mais novas para as mais
+        antigas (o M1 do terminal some primeiro nas antigas), dentro do tempo da sincronização (``started``).
+        Falha fica para a próxima vez."""
+        assert self._entry_context is not None
+        service = ", ".join("?" * len(_SERVICE_REASONS))
+        with self._db(write=False) as conn:
+            pending = conn.execute(
+                "SELECT o.id, o.posicao_id, o.simbolo, o.direcao, o.abertura_utc, "
+                "(SELECT n.preco FROM negocios n WHERE n.conta_login = o.conta_login AND n.conta_servidor = "
+                "o.conta_servidor AND n.posicao_id = o.posicao_id AND n.entrada IN ('in', 'inout') AND n.motivo NOT IN "
+                f"({service}) ORDER BY n.horario_utc, n.ticket LIMIT 1) AS preco "
+                "FROM operacoes o WHERE o.conta_login = ? AND o.conta_servidor = ? AND "
+                "(o.contexto_versao IS NULL OR o.contexto_versao < ?) ORDER BY o.abertura_utc DESC, o.id DESC",
+                (*_SERVICE_REASONS, login, server, self._context_version),
+            ).fetchall()
+        measured: list[tuple[int, str]] = []
+        failed: list[str] = []
+        left = 0
+        for i, row in enumerate(pending):
+            if self._monotonic() - started > self._context_budget:
+                left = len(pending) - i
+                break
+            if row["preco"] is None:
+                failed.append(f"posição {row['posicao_id']}: negócio de entrada não encontrado")
+                continue
+            try:
+                found = self._entry_context(row["simbolo"], row["direcao"], _parse(row["abertura_utc"]), row["preco"])
+            except (MT5Error, ValueError) as exc:
+                failed.append(f"posição {row['posicao_id']}: {exc}")
+                continue
+            except Exception as exc:  # um erro de cálculo não derruba a sincronização (os fatos já foram gravados)
+                logger.exception("Contexto da entrada da posição %s", row["posicao_id"])
+                failed.append(f"posição {row['posicao_id']}: erro inesperado ({type(exc).__name__}: {exc})")
+                continue
+            measured.append((row["id"], json.dumps(found, ensure_ascii=False)))
+        saved = 0
+        if measured:
+            try:
+                with self._db(write=True) as conn:
+                    for op_id, text in measured:
+                        conn.execute(
+                            "UPDATE operacoes SET contexto_entrada = ?, contexto_versao = ? WHERE id = ?",
+                            (text, self._context_version, op_id),
+                        )
+                saved = len(measured)
+            except JournalError as exc:  # os fatos já foram gravados: a sincronização não se perde
+                warnings.append(f"Contexto da entrada de {len(measured)} operação(ões) medido mas não gravado ({exc}); "
+                                "grava na próxima sincronização.")
+        if failed:
+            shown = "; ".join(failed[:3]) + (f" (e mais {len(failed) - 3})" if len(failed) > 3 else "")
+            warnings.append(f"Contexto da entrada não medido em {len(failed)} operação(ões) ({shown}); tenta de novo "
+                            "na próxima sincronização.")
+        if left:
+            warnings.append(f"Faltou tempo para medir o contexto da entrada de {left} operação(ões): rode "
+                            "`journal_sincronizar` de novo (não duplica).")
+        return {"medidos_agora": saved, "faltando": left + len(failed) + len(measured) - saved}
 
     # ------------------------------------------------------------------ anotações
     def annotate(
@@ -710,7 +805,7 @@ class Journal:
 
     # ------------------------------------------------------------------ consultas
     @staticmethod
-    def _view(row: sqlite3.Row) -> dict[str, Any]:
+    def _view(row: sqlite3.Row, detailed_context: bool = False) -> dict[str, Any]:
         r = dict(row)
         opened, closed = _parse(r["abertura_utc"]), _parse(r["fechamento_utc"])
         closed_trade = r["status"] == "fechada"
@@ -744,7 +839,13 @@ class Journal:
             "tags": r["tags"],
             "motivo": r["motivo"],
             "observacoes": r["observacoes"],
+            "contexto": None,
         }
+        if r.get("contexto_entrada"):
+            context = json.loads(r["contexto_entrada"])
+            view["contexto"] = contexto_entrada.dimensions(context, r["direcao"])
+            if detailed_context:
+                view["contexto_detalhado"] = context
         if not closed_trade:
             view["nota_resultado"] = (
                 "Operação ainda aberta: só a parte realizada (comissões e saídas parciais). O resultado flutuante "
@@ -777,6 +878,7 @@ class Journal:
         setup: str = "",
         status: str | None = None,
         limit: int = 30,
+        detailed_context: bool = False,
     ) -> dict[str, Any]:
         where, params = _filters(symbol, setup)
         if days:
@@ -801,7 +903,7 @@ class Journal:
             "conta": {"login": login, "servidor": server},
             "ultima_sincronizacao": _show(synced),
             "total": len(rows),
-            "operacoes": [self._view(r) for r in rows[: max(1, limit)]],
+            "operacoes": [self._view(r, detailed_context) for r in rows[: max(1, limit)]],
             "setups_existentes": setups,
         }
 
@@ -823,6 +925,11 @@ class Journal:
         if not_closed:
             notes.append(f"{not_closed} operação(ões) aberta(s) ou parcialmente fechada(s) ficaram de fora.")
         general = _stats(rows)
+        dims = {
+            r["id"]: contexto_entrada.dimensions(json.loads(r["contexto_entrada"]), r["direcao"])
+            for r in rows if r.get("contexto_entrada")
+        }
+        with_context = [r for r in rows if r["id"] in dims]
         observed = general["r"]["por_fonte_do_stop"].get("observado", 0)
         if observed:
             notes.append(
@@ -838,6 +945,11 @@ class Journal:
             "por_simbolo": _group(rows, lambda r: r["simbolo"]),
             "por_noticia": _group(rows, lambda r: r["noticia"]),
             "por_direcao": _group(rows, lambda r: r["direcao"]),
+            "por_tag": _group(rows, lambda r: [t.strip() for t in r["tags"].split(",")] if r["tags"] else "sem tag"),
+            "por_contexto": {
+                name: _group(with_context, lambda r, n=name: dims[r["id"]][n]) for name in contexto_entrada.DIMENSIONS
+            },
+            "operacoes_sem_contexto": len(rows) - len(with_context),
             "observacoes": notes,
         }
 

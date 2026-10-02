@@ -158,7 +158,17 @@ O journal registra as operações da conta demo para medir o que funciona. **O M
 
 - **Stop inicial e R**: o stop inicial vem da ordem que abriu a posição (quando o stop foi definido na boleta). Se você só colocou o stop depois, o journal usa o stop visto com a posição aberta na primeira sincronização (marcado como `observado`, porque pode já ter sido movido), ou o que você informar com `journal_anotar`. Risco inicial = perda até esse stop; R = resultado líquido / risco inicial.
 - **Notícia**: a operação é marcada `sim` quando houve evento dos EUA de importância alta entre 30 min antes da entrada e o fechamento, pelo calendário do MT5. O arquivo do calendário cobre só os dias de `InpDaysBack` do serviço (padrão 7): sincronize dentro desse prazo, senão a marcação fica `desconhecido`. Você pode corrigir com `journal_anotar`.
-- **Estatísticas**: só operações fechadas; cada grupo mostra o tamanho da amostra e quantas operações ficaram sem R. Calculadas no servidor, sempre do mesmo jeito.
+- **Contexto da entrada** (`contexto`): na sincronização, o journal mede sozinho o contexto SMC na hora da primeira entrada, **só com candles que já tinham fechado nela** (nada do que o preço fez depois; nem o candle que estava aberto). Usa as mesmas regras de `estrutura_smc` e compara com a direção da operação:
+  - `sessao` (Ásia, Londres, Nova York ou fora);
+  - `estrutura_M5`, `_M15`, `_H1`, `_H4` (micro) e `estrutura_macro_H1`: tendência por fechamento a favor ou contra;
+  - `varredura_a_favor`: liquidez do lado contrário tomada antes, com o preço de volta na entrada (abaixo numa compra, acima numa venda). Em ordem de peso: `nivel_chave` (máxima/mínima do dia e da semana anteriores e das sessões encerradas, nas 2 h antes), `liquidez_igual` (topos/fundos iguais), `topo_fundo` (topo/fundo micro do M5/M15, 2 h) e `topo_fundo_m1_m3` (M1/M3, 30 min);
+  - `choch_a_favor` (o menor timeframe entre M1, M3 e M5 com CHoCH por fechamento a favor nos 30 min antes) e `choch_contra`;
+  - `zona_a_favor` (OB não mitigado e/ou FVG aberto a favor contendo o preço de entrada; numa compra, comparado pelo bid estimado, porque os candles são de bid) e `zona_contra`;
+  - `premium_discount_M15` e `_H1`: comprar em discount ou vender em premium = a favor.
+
+  `journal_listar` mostra esses rótulos; com `contexto_detalhado`, também os níveis, zonas, CHoCH e varreduras. Cada operação leva ~0,6 s; a sincronização mede enquanto não passa de ~30 s e deixa o resto para a próxima (avisa). Timeframe sem histórico no terminal (o M1 cobre ~3 meses) fica `sem_dados`. Mudando as regras, a versão do contexto sobe e tudo é medido de novo.
+- **Ingredientes seus** (gatilho, timeframe de entrada, confluências): anote em `tags` com `journal_anotar`, sempre com os mesmos nomes; as estatísticas agrupam por tag (uma operação com várias tags conta em cada uma).
+- **Estatísticas**: só operações fechadas; cada grupo mostra o tamanho da amostra e quantas operações ficaram sem R. Calculadas no servidor, sempre do mesmo jeito. Além de setup, símbolo, notícia e direção, saem `por_tag` e `por_contexto` (um agrupamento para cada rótulo do contexto). Cada rótulo é uma leitura isolada: com poucas operações, a diferença entre grupos não prova nada. Não há métrica de quanto a operação poderia ter ganho.
 - **Onde fica**: o banco fica em `trading-mcp\journal.sqlite3` na pasta do seu usuário, fora do OneDrive (sincronizar um banco aberto pode corrompê-lo) e fora do AppData (o Claude Desktop da Microsoft Store redireciona o AppData dos programas que ele abre). `journal_exportar` grava uma cópia do banco e um CSV (separador `;`, vírgula decimal, abre direto no Excel) em `journal_export`, dentro do projeto: como o projeto está no OneDrive, as cópias vão para a nuvem.
 
 ## Exemplos de perguntas
@@ -257,6 +267,7 @@ src/trading_mcp/
 ├── calendario.py      # Calendário econômico (lê o arquivo do serviço MQL5)
 ├── posicoes.py        # Relatório de posições e ordens pendentes
 ├── journal.py         # Journal de operações em SQLite (importado do histórico do MT5)
+├── contexto_entrada.py # Contexto SMC na hora da entrada de cada operação (para as estatísticas do journal)
 ├── reacao.py          # Reação a eventos e contexto entre ativos
 ├── reacoes.py         # Reações guardadas (SQLite) e estatísticas por tipo de surpresa
 ├── smc.py             # Estrutura SMC: topos/fundos, BOS/CHoCH, FVG, order blocks, liquidez, sessões
@@ -288,9 +299,9 @@ mql5/Services/
 - Validado em 2026-10-01 com uma conta demo Standard da Exness (`docs/diagnostico-mt5-2026-10-01.md`). Troca de conta e perda de conexão com o servidor rodando ainda não foram reproduzidas no terminal real, só com o MT5 simulado.
 - O estado da cotação deduz a sessão pela semana anterior: num feriado, uma cotação parada aparece como `atrasado`; se o feriado foi na semana anterior, uma parada real hoje aparece como `mercado_fechado_provavel`. Na semana da mudança do horário de verão, a pausa diária pode ser classificada errada por 1 hora.
 - O fuso UTC do servidor precisa ser reconferido depois de 1/11/2026 (fim do horário de verão dos EUA).
-- Calendário: depende do terminal aberto com o serviço rodando. Alguns indicadores ficam sem realizado no calendário do MT5 (em 2026-10-01, o PMI industrial da S&P Global continuava sem valor horas depois da divulgação). A latência da fonte ainda não foi medida numa divulgação real.
+- Calendário: depende do terminal aberto com o serviço rodando. Alguns indicadores ficam sem realizado no calendário do MT5 (em 2026-10-01, o PMI industrial da S&P Global continuava sem valor horas depois da divulgação). No payroll de 2/10, o número principal chegou ao arquivo 9 s depois da divulgação; os componentes (salário por hora, payroll privado) vieram depois, sem tempo medido.
 - Posições (`posicoes`): conferido no terminal real em 2026-10-02 com uma venda e uma compra limitada (veja `docs/`); uma posição de compra ainda não foi aberta no terminal real. Comissão não aparece (fica nos negócios do histórico).
-- Journal: conferido no terminal real em 2026-10-02 com uma operação manual de BTCUSDm. O risco inicial usa a cotação de conversão do momento da sincronização (exato para símbolos cotados em dólar, como USTEC e US30). Comissões cobradas por dia ou por mês, fora das operações, não entram no resultado.
+- Journal: conferido no terminal real em 2026-10-02 com uma operação manual de BTCUSDm. O contexto da entrada foi conferido com as três operações da demo de 2/10 (BTCUSD, JP225 e US30; veja `docs/`). O risco inicial usa a cotação de conversão do momento da sincronização (exato para símbolos cotados em dólar, como USTEC e US30). Comissões cobradas por dia ou por mês, fora das operações, não entram no resultado.
 - Para alguns bancos e empresas com duas classes de ações, `caixa` e `acoes_em_circulacao` vêm vazios, com uma observação explicando.
 
 ## Roadmap
@@ -300,7 +311,7 @@ Revisado em 2026-10-01. Tudo continua somente leitura até a etapa F.
 - **A** (feito): base validada no MT5 real (identidade da conta, horários em UTC, estado da cotação).
 - **B** (feito): calendário econômico (B2), consulta de posições com distâncias e risco até o stop (B1) e journal em SQLite importado do MT5 (B3).
 - **C**: reação observada a eventos e contexto entre ativos para os instrumentos operados (C1) e reações guardadas para estatísticas por tipo de surpresa (C2), ambas feitas. Próximo: notícias, só depois de medir a latência das fontes gratuitas.
-- **D**: o SMC do usuário é discricionário (sem setup fixo), então a etapa virou ferramentas de estrutura (D1: `estrutura_smc`, feito) e, em seguida, registrar no journal os elementos de cada operação (varredura, CHoCH, OB, FVG, timeframe, sessão) para medir quais combinações funcionam. Backtest só de uma variante que os dados indicarem.
+- **D**: o SMC do usuário é discricionário (sem setup fixo), então a etapa virou ferramentas de estrutura (D1: `estrutura_smc`, feito) e o contexto SMC de cada operação no journal (D2, feito: sessão, estrutura, CHoCH, varredura, OB/FVG, premium/discount, medidos sozinhos na hora da entrada, mais as tags do usuário) para medir quais combinações funcionam. Backtest só de uma variante que os dados indicarem.
 - **E**: propostas de operação com limites rígidos e aprovação humana fora do chat, ainda sem envio.
 - **F**: execução **somente em conta demo**, com verificação de conta imediatamente antes do envio, reconciliação e kill switch.
 - **G**: coleta contínua, alertas ou dashboard, só se o uso justificar.

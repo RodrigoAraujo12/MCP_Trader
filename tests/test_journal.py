@@ -472,8 +472,10 @@ def test_version_1_database_is_migrated(tmp_path):
     path.parent.mkdir()
     from trading_mcp import journal as module
 
-    old_schema = module._SCHEMA.replace("    noticia_ate_utc TEXT,\n", "")
-    assert "noticia_ate_utc" not in old_schema
+    old_schema = module._SCHEMA
+    for name, kind in module._ADDED_COLUMNS.items():
+        old_schema = old_schema.replace(f"    {name} {kind},\n", "")
+        assert name not in old_schema
     with sqlite3.connect(path) as conn:
         conn.executescript(old_schema)
         conn.execute("INSERT INTO meta VALUES ('schema', '1')")
@@ -481,8 +483,8 @@ def test_version_1_database_is_migrated(tmp_path):
     journal.sync(7)
     with sqlite3.connect(path) as conn:
         columns = {r[1] for r in conn.execute("PRAGMA table_info(operacoes)")}
-        assert "noticia_ate_utc" in columns
-        assert conn.execute("SELECT valor FROM meta WHERE chave = 'schema'").fetchone()[0] == "2"
+        assert set(module._ADDED_COLUMNS) <= columns
+        assert conn.execute("SELECT valor FROM meta WHERE chave = 'schema'").fetchone()[0] == str(module.SCHEMA_VERSION)
 
 
 def test_newer_schema_is_not_touched(tmp_path):

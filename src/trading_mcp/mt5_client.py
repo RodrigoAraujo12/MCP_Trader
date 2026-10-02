@@ -45,6 +45,7 @@ _ALLOWED_CALLS = frozenset(
         "symbol_info",
         "symbol_info_tick",
         "symbol_select",
+        "copy_rates_from",
         "copy_rates_from_pos",
         "copy_rates_range",
         "copy_ticks_range",
@@ -683,6 +684,49 @@ class MT5Client:
         df["time"] = pd.to_datetime(df["time"].astype("int64"), unit="s", utc=True)
         df.attrs["conectado"] = connected
         return df.reset_index(drop=True)
+
+    @_guard
+    def rates_until(self, symbol: str, timeframe: str, end: datetime, count: int) -> pd.DataFrame:
+        """Até ``count`` candles já fechados no instante ``end`` (UTC), do mais antigo ao mais novo; pode vir vazio.
+
+        ``copy_rates_from`` devolve os candles que abriram até ``end``, inclusive o que estava aberto nele (conferido
+        em 2026-10-02): esse é descartado, porque a máxima, a mínima e o fechamento dele incluem o que veio depois.
+        Pedindo uma data anterior ao início do histórico, o terminal devolve o primeiro candle que tem, que é
+        posterior: todo candle que termina depois de ``end`` é descartado. ``df.attrs["conectado"]`` informa a
+        conexão com a corretora.
+        """
+        tf_key = (timeframe or "").strip().upper()
+        if tf_key not in TIMEFRAMES:
+            raise ValueError(f"Timeframe inválido: '{timeframe}'. Válidos: {', '.join(TIMEFRAMES)}.")
+        if end.tzinfo is None:
+            raise ValueError("Informe o horário com fuso horário (UTC).")
+        end = end.astimezone(timezone.utc)
+        with self._lock:
+            resolved = self.resolve_symbol(symbol)
+            tf = getattr(self._module(), TIMEFRAMES[tf_key])
+            # Só o limite do terminal: o MAX_BARS do .env vale para os pedidos do usuário, não para o contexto
+            # (que precisa de todos os candles pedidos para não marcar falta onde não há).
+            terminal_limit = self._terminal_maxbars - 1 if self._terminal_maxbars else int(count) + 1
+            request = max(1, min(int(count) + 1, terminal_limit))
+            data = None
+            for attempt in range(_RATES_ATTEMPTS):
+                if attempt:
+                    self._sleep(_RATES_RETRY_S)
+                data = self._call("copy_rates_from", resolved, tf, end, request)
+                # Histórico ainda não carregado volta vazio (ou None) na primeira chamada.
+                if data is not None and len(data):
+                    break
+            connected = self._connected
+        if data is None:
+            raise MT5Error(f"Sem candles de {resolved} em {tf_key}: {self._last_error()}")
+        df = pd.DataFrame(data, columns=_RATE_COLUMNS) if len(data) else pd.DataFrame(columns=_RATE_COLUMNS)
+        df["time"] = pd.to_datetime(df["time"].astype("int64"), unit="s", utc=True)
+        if len(df):
+            closed = [not tempo.bar_in_progress(t.to_pydatetime(), tf_key, end) for t in df["time"]]
+            df = df[closed]
+        df = df.tail(int(count)).reset_index(drop=True)
+        df.attrs["conectado"] = connected
+        return df
 
     @_guard
     def oldest_bar(self, symbol: str, timeframe: str) -> datetime:

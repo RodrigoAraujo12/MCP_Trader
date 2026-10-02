@@ -18,7 +18,8 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import ToolAnnotations
 from pydantic import Field
 
-from trading_mcp import indicators, posicoes as posicoes_report, reacao, reacoes as reacoes_module, risk, smc, tempo
+from trading_mcp import contexto_entrada, indicators, posicoes as posicoes_report, reacao, reacoes as reacoes_module
+from trading_mcp import risk, smc, tempo
 from trading_mcp.calendario import CalendarError, EconomicCalendar
 from trading_mcp.config import Settings, load_settings
 from trading_mcp.journal import Journal, JournalError
@@ -87,8 +88,14 @@ Regras de uso:
   usuário.
 - Journal: rode `journal_sincronizar` antes de listar, anotar ou tirar estatísticas (importa do MT5 sem
   duplicar e sem apagar anotações). Use `journal_anotar` para setup, motivo, observações e o stop inicial
-  quando faltar; reaproveite os nomes de `setups_existentes`. As estatísticas vêm prontas do servidor: não
-  recalcule; cite o tamanho da amostra e os dados faltantes (sem stop inicial = sem R).
+  quando faltar; reaproveite os nomes de `setups_existentes`. Ingredientes que só o usuário sabe (gatilho,
+  timeframe de entrada, confluências) vão em `tags`, com os mesmos nomes de sempre. As estatísticas vêm prontas do
+  servidor: não recalcule; cite o tamanho da amostra e os dados faltantes (sem stop inicial = sem R).
+- Contexto da entrada (`contexto` no journal): medido sozinho na sincronização, só com candles fechados antes da
+  entrada (sessão, estrutura por timeframe, CHoCH, varredura de liquidez, OB/FVG, premium/discount, a favor ou
+  contra a operação). Em `por_contexto` cada item é uma leitura isolada; com amostra pequena, não tire regra. Não
+  calcule nem mostre quanto a operação poderia ter ganho (máximo a favor, preço depois da saída): o usuário não
+  quer essa comparação.
 - Os dados servem para estudo e análise; não são recomendação de investimento.
 """
 
@@ -148,7 +155,11 @@ def create_server(
     calendar = calendar or EconomicCalendar(
         lambda: Path(mt5.terminal_data_path()) / "MQL5" / "Files" / "trading_mcp" / f"calendar_{CALENDAR_COUNTRY}.json"
     )
-    journal = journal or Journal(settings.journal_path, settings.journal_export_dir, mt5, calendar)
+    journal = journal or Journal(
+        settings.journal_path, settings.journal_export_dir, mt5, calendar,
+        entry_context=lambda symbol, direction, when, price: contexto_entrada.compute(mt5, symbol, direction, when, price),
+        context_version=contexto_entrada.VERSION,
+    )
     reactions = reactions or ReactionStore(
         settings.reacoes_path, mt5, calendar, settings.instruments, backup_dir=settings.journal_export_dir
     )
@@ -555,7 +566,8 @@ def create_server(
         dias: Annotated[float, Field(gt=0, le=366, description="Dias de histórico do MT5 a importar")] = 7,
     ) -> dict[str, Any]:
         """Importa para o journal local as operações da conta (posições do MT5): entrada, saída, volume, custos,
-        resultado, stop inicial e notícia durante a operação. Pode rodar sempre: não duplica nem apaga anotações.
+        resultado, stop inicial, notícia durante a operação e o contexto SMC da entrada. Pode rodar sempre: não
+        duplica nem apaga anotações; se faltar tempo para o contexto, rode de novo.
         """
         with _tool_errors():
             return journal.sync(dias)
@@ -597,11 +609,16 @@ def create_server(
         setup: Annotated[str, Field(description="Filtrar por setup")] = "",
         status: Annotated[Literal["aberta", "parcial", "fechada"] | None, Field(description="Filtrar por status")] = None,
         limite: Annotated[int, Field(ge=1, le=200, description="Máximo de operações")] = 30,
+        contexto_detalhado: Annotated[
+            bool, Field(description="Inclui os detalhes do contexto da entrada (níveis, zonas, CHoCH, varreduras)")
+        ] = False,
     ) -> dict[str, Any]:
-        """Operações do journal, da mais recente para a mais antiga, com resultado, R, stop inicial, notícia e
-        anotações. Traz também os setups já usados."""
+        """Operações do journal, da mais recente para a mais antiga, com resultado, R, stop inicial, notícia,
+        anotações e o contexto SMC da entrada (a favor/contra). Traz também os setups já usados."""
         with _tool_errors():
-            return journal.list_operations(days=dias, symbol=simbolo, setup=setup, status=status, limit=limite)
+            return journal.list_operations(
+                days=dias, symbol=simbolo, setup=setup, status=status, limit=limite, detailed_context=contexto_detalhado
+            )
 
     @server.tool(annotations=JOURNAL_READ)
     def journal_estatisticas(
@@ -610,7 +627,8 @@ def create_server(
         setup: Annotated[str, Field(description="Filtrar por setup")] = "",
     ) -> dict[str, Any]:
         """Estatísticas das operações fechadas: quantidade, taxa de acerto, resultado, ganho e perda médios,
-        fator de lucro, R; por setup, símbolo, notícia e direção, com tamanho da amostra e dados faltantes."""
+        fator de lucro, R; por setup, símbolo, notícia, direção, tag e contexto SMC da entrada, com tamanho da
+        amostra e dados faltantes."""
         with _tool_errors():
             return journal.stats(days=dias, symbol=simbolo, setup=setup)
 

@@ -130,6 +130,13 @@ Um script lia o arquivo do calendário a cada 5 s, com o serviço rodando desde 
 - Nesse momento, salário por hora (mensal e anual), payroll privado, participação e U6 ainda vinham sem realizado. Mais tarde todos tinham valor (salário mensal 0,1% contra previsão de 0,3%), mas não se sabe quando chegaram: o script parou no primeiro realizado e o reinício do serviço às 16:08 UTC zerou `actual_seen_gmt` (ele só é preenchido quando o serviço vê o valor aparecer).
 - Na prática: o número principal aparece em segundos; os componentes podem demorar mais, e nesse intervalo `reacao_evento` mostra a surpresa só do que já saiu.
 
+## Contexto da entrada no journal (etapa D2, 2026-10-02 ~19:30 UTC)
+
+- `copy_rates_from(símbolo, tf, horário, n)` devolve os `n` candles que **abriram** até o horário, inclusive o que ainda estava aberto nele (US30m às 13:29:13 UTC: último M1 13:29, último M5 13:25, último H4 12:00, último D1 o do próprio dia). O cliente descarta esse candle: a máxima, a mínima e o fechamento dele já incluem o que veio depois.
+- Medir o contexto de uma operação (M1, M3, M5, M15, H1 e H4 com 1.500 candles cada, mais 4.600 de M5 para os níveis) levou ~0,6 s; a sincronização das 3 operações da demo, 3,4 s, e a segunda, nada (já medidas).
+- Compra do US30 às 13:29:13 UTC (stop em 1 min e meio): entrada dentro do OB de baixa do H1 (51.346,9–51.521,5) e com CHoCH de baixa no M1 e no M3 (fundo de 51.353,4 rompido por fechamento às 13:27). O CHoCH do M5 que a análise feita depois mostrava só fechou às 13:30, depois da entrada, e por isso não entra: é o comportamento esperado sem olhar para frente.
+- Compra do JP225 às 12:43:39 UTC: estrutura de alta do M5 ao H4, CHoCH de alta no M1 22 min antes, fundos iguais do M1 (69.287,9) varridos às 12:18 e preço acima da faixa macro do M15 e do H1, dentro de um OB de baixa largo do H1. Os fundos iguais só apareceram depois de incluir o M1 e o M3 nas varreduras (janela de 30 min).
+
 ## Ainda não reproduzido no terminal real
 
 - Troca de conta e perda de conexão com o servidor em execução. Estão cobertas por testes com MT5 simulado.
