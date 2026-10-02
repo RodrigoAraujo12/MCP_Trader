@@ -115,7 +115,22 @@ Os índices da Exness vêm com moeda base e de lucro = USD (por isso "pips" só 
 - Tempo: com o histórico já carregado no terminal, cada chamada leva milissegundos e um horário de divulgação com os 9 instrumentos leva ~0,3–0,5 s. A primeira leitura de um período antigo leva alguns segundos (o terminal baixa o histórico). Com o calendário de 7 dias: 48 divulgações, 22 horários, 198 medições em ~10 s.
 - Os números guardados batem com `reacao_evento` no mesmo horário (Claims de 1/10, 12:30 UTC: USTEC −0,008/+0,025/−0,038% e ouro +0,044/+0,102/+0,066% em 1/5/15 min).
 
+## Primeira carga com 100 dias (2026-10-02, ~16:10 UTC)
+
+- `InpDaysBack` mudado de 7 para 100 em Propriedades, sem recompilar: o terminal parou e reiniciou o serviço sozinho (16:08:22 UTC) e o arquivo saiu no mesmo segundo, com 200 eventos e 1.157 valores, de 24/06 a 16/10. O arquivo passou de 112 KB para 329 KB.
+- `reacoes_registrar` (mesma montagem do servidor, rodada por script) guardou 444 divulgações novas, 499 no total, de 24/06 a 02/10. Foram três chamadas até não faltar horário: 40 s, 40 s e 15 s (o limite de ~40 s por chamada funcionou), com 1.817 medições, das quais 64 ficaram a confirmar. A chamada 11 min depois refez as 64, todas iguais: nenhuma a confirmar nem não confirmável.
+- Fora do histórico M1: BTCUSD em 66 medições (M1 só desde 25/07), DXY em 7, GBPUSD em 5 e EURUSD em 4. O início do M1 anda junto com o relógio (o terminal guarda um número fixo de candles), então esse corte avança a cada dia.
+- Amostra em 3 meses: Claims com 15 divulgações e estoques de petróleo da EIA com 14; eventos mensais (ADP, payroll, CPI) com 3 ou 4 cada.
+
+## Latência do calendário no NFP (2026-10-02, 12:30 UTC)
+
+Um script lia o arquivo do calendário a cada 5 s, com o serviço rodando desde 09:52 UTC.
+
+- O realizado do payroll (29 mil; previsão 52 mil; anterior 162 mil, revisado para 133 mil) e o da taxa de desemprego (4,2%; previsão 4,1%) chegaram juntos: o serviço os viu às 12:30:09 (`actual_seen_gmt`, latência de 9 s; como ele confere a cada 15 s, a fonte publicou em até 9 s), o arquivo foi gravado no mesmo segundo e o script o leu às 12:30:10.
+- Nesse momento, salário por hora (mensal e anual), payroll privado, participação e U6 ainda vinham sem realizado. Mais tarde todos tinham valor (salário mensal 0,1% contra previsão de 0,3%), mas não se sabe quando chegaram: o script parou no primeiro realizado e o reinício do serviço às 16:08 UTC zerou `actual_seen_gmt` (ele só é preenchido quando o serviço vê o valor aparecer).
+- Na prática: o número principal aparece em segundos; os componentes podem demorar mais, e nesse intervalo `reacao_evento` mostra a surpresa só do que já saiu.
+
 ## Ainda não reproduzido no terminal real
 
 - Troca de conta e perda de conexão com o servidor em execução. Estão cobertas por testes com MT5 simulado.
-- Latência do calendário numa divulgação real. A primeira oportunidade é o NFP de 2/10, às 12:30 UTC, com o serviço rodando antes.
+- Quanto tempo os componentes de um evento (salário por hora, payroll privado) demoram depois do número principal.
