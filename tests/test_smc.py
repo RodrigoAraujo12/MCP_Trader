@@ -332,3 +332,57 @@ def test_premium_discount_range_follows_a_breakout():
     # Depois do topo, a máxima chegou a 14,5: a faixa vai de 9,5 a 14,5 e 13 fica em premium.
     assert zone == {"faixa": [9.5, 14.5], "posicao_pct": 70.0, "zona": "premium"}
     assert smc._premium_discount(df, macro, 15.0, fmt)["zona"] == "acima_da_faixa"
+
+
+# ---------------------------------------------------------------- alvos
+def _levels_and_frames():
+    levels = {
+        "dia_mercado_atual": {"maxima": 105.0, "minima": 95.0},
+        "dia_mercado_anterior": {"maxima": 108.0, "minima": 92.0, "minima_varrida_em": "2026-10-02T03:00:00Z"},
+        "semana_mercado_anterior": {"maxima": 120.0, "minima": 80.0, "maxima_rompida_em": "2026-10-01T03:00:00Z"},
+        "sessoes_hoje": {
+            "asia": {"situacao": "concluida", "maxima": 103.0, "minima": 97.0, "maxima_varrida_em": "x"},
+            "londres": {"situacao": "concluida", "maxima": 104.0, "minima": 96.0},
+            "nova_york": {"situacao": "em_andamento", "maxima": 105.0, "minima": 99.0},
+        },
+        "topos_fundos_diarios": [{"tipo": "topo", "preco": 110.0, "dia": "2026-09-20"}],
+    }
+    frames = {"M15": {"estrutura": {}, "liquidez_igual": [{"tipo": "topos_iguais", "nivel": 104.02}],
+                      "order_blocks": [{"direcao": "baixa", "de": 106.0, "ate": 107.0},
+                                       {"direcao": "alta", "de": 93.0, "ate": 94.0}],
+                      "fvg_abertos": [{"direcao": "alta", "de": 101.0, "ate": 102.0}]}}
+    return levels, frames
+
+
+def test_targets_list_untaken_liquidity_and_opposite_zones_by_distance():
+    levels, frames = _levels_and_frames()
+    out = smc.targets(levels, frames, 100.0, 2)
+    above = [(t["preco"], t["tipos"]) for t in out["acima"]]
+    # A máxima da Ásia (varrida) e a da semana anterior (rompida) ficam de fora; 104 e 104,02 viram um alvo só.
+    assert above[0] == (104.0, ["Máx. Londres", "Topos iguais M15"])
+    assert [p for p, _ in above] == [104.0, 105.0, 106.0, 108.0, 110.0]
+    assert "Máx. Ásia" not in str(above) and 120.0 not in [p for p, _ in above]
+    below = [(t["preco"], t["tipos"][0]) for t in out["abaixo"]]
+    # Nova York está em andamento (fora); a mínima do dia anterior (92) já foi varrida.
+    assert below == [(97.0, "Mín. Ásia"), (96.0, "Mín. Londres"), (95.0, "Mín. de hoje (até agora)"),
+                     (94.0, "OB de alta M15 (início)"), (80.0, "Mín. semana anterior")]
+    assert out["acima"][0]["distancia"] == 4.0 and out["acima"][0]["distancia_pct"] == 4.0
+
+
+def test_targets_with_entry_and_stop_give_risk_reward_only_in_trade_direction():
+    levels, frames = _levels_and_frames()
+    out = smc.targets(levels, frames, 100.0, 2, entry=100.0, stop=98.0)
+    assert out["operacao"] == {"direcao": "compra", "entrada": 100.0, "stop": 98.0, "risco": 2.0,
+                               "alvos_na_direcao": "acima"}
+    assert out["acima"][0]["risco_retorno"] == 2.0  # 104: 4 de alvo para 2 de risco
+    assert all("risco_retorno" not in t for t in out["abaixo"])
+    sell = smc.targets(levels, frames, 100.0, 2, entry=100.0, stop=101.0)
+    assert sell["operacao"]["direcao"] == "venda" and "risco_retorno" in sell["abaixo"][0]
+
+
+def test_report_validates_entry_and_stop():
+    client, _ = make_client(FakeMT5([make_symbol("EURUSD")], rates={"EURUSD": _random_walk(300)}))
+    with pytest.raises(ValueError, match="entrada e stop juntos"):
+        smc.report(client, "EURUSD", ["M15"], entry=1.1)
+    with pytest.raises(ValueError, match="diferente da entrada"):
+        smc.report(client, "EURUSD", ["M15"], entry=1.1, stop=1.1)

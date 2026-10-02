@@ -90,7 +90,7 @@ Use uma instalação **separada** do MT5, logada **só** na conta demo, e aponte
 | `contexto_mercado` | Instrumentos lado a lado: variação em 15 min, 1 h, 4 h e no dia, faixa do dia e estado da cotação | `simbolos` (padrão: `INSTRUMENTOS`) |
 | `reacoes_registrar` | Guarda as divulgações dos EUA que o calendário cobre e a reação medida de cada instrumento (não duplica; se faltar tempo, rode de novo) | — |
 | `reacoes_estatisticas` | Reações guardadas a um evento, agrupadas pela surpresa (acima, abaixo ou igual à previsão), com o tamanho da amostra | `evento` (vazio = o que está guardado), `simbolos`, `janelas_min` (1, 5, 15, 60; padrão 5 e 15), `dias` |
-| `estrutura_smc` | Estrutura SMC (só medição): topos e fundos micro e macro, BOS/CHoCH por pavio e por fechamento, premium/discount, FVGs, order blocks, liquidez igual e varreduras; máxima/mínima do dia e da semana de mercado e das sessões, topos/fundos diários | `simbolo`, `timeframes` (M1, M3, M5, M15, M30, H1, H4, D1; padrão M5, M15, H1, H4) |
+| `estrutura_smc` | Estrutura SMC (só medição): topos e fundos micro e macro, BOS/CHoCH por pavio e por fechamento, premium/discount, FVGs, order blocks, liquidez igual e varreduras; máxima/mínima do dia e da semana de mercado e das sessões, topos/fundos diários; alvos acima e abaixo | `simbolo`, `timeframes` (M1, M3, M5, M15, M30, H1, H4, D1; padrão M5, M15, H1, H4), `entrada` e `stop` (opcionais, para o risco/retorno de cada alvo) |
 | `journal_sincronizar` | Importa as operações da conta do histórico do MT5 para o journal (não duplica, não apaga anotações) | `dias` (padrão 7) |
 | `journal_anotar` | Anota uma operação: setup, tags, motivo, observação, stop inicial, notícia | `operacao_id` ou `ticket`, e os campos a gravar |
 | `journal_listar` | Operações com resultado, R, stop inicial, notícia e anotações | `dias` (padrão 30), `simbolo`, `setup`, `status`, `limite` |
@@ -149,6 +149,7 @@ O calendário do terminal cobre poucos dias para trás e o M1, cerca de 3 meses:
 - **Order block**: no rompimento por fechamento, o candle de mínima mais baixa (ou máxima mais alta) entre o topo/fundo rompido e o rompimento (regra da LuxAlgo); zona de pavio a pavio; sai da lista quando um candle fecha além da zona; `tocado` = o pavio já voltou nela. O mesmo candle no micro e no macro aparece uma vez.
 - **Liquidez**: topos/fundos iguais (a menos de 0,1 ATR; três ou mais seguidos viram um grupo) ainda não tomados; varreduras recentes (pavio além e fechamento de volta) dos topos/fundos micro e da liquidez igual, com `rompido_depois_em` quando o preço depois fechou além.
 - **Níveis** (`niveis`): máxima e mínima do dia e da semana de mercado atuais (até agora; no fim de semana, a semana atual é a que fechou na sexta) e anteriores (o dia vira às 17:00 de Nova York, pulando fim de semana e feriado; a semana, domingo 17:00); sessões de hoje e do dia anterior em sequência, cada uma até a abertura da seguinte (Ásia: Tóquio 9 h até Londres 8 h; Londres até Nova York 8 h; Nova York até 17 h, no horário local de cada praça); e os topos/fundos diários que nenhum candle passou, nem o de hoje (candle D1 do MT5, que vira às 00:00 UTC; o toco de domingo entra na segunda). Para cada máxima/mínima de um período encerrado, se e quando foi **varrida** (pavio além e fechou de volta) e/ou **rompida** (fechou além), em candles M5 fechados; `incompleto` = o histórico M5 do terminal não chega ao início do período.
+- **Alvos** (`alvos`): até 5 acima e 5 abaixo do preço (ou da entrada), do mais perto ao mais longe: liquidez ainda não tomada (máximas/mínimas do dia e da semana anteriores e das sessões encerradas, máxima/mínima de hoje, topos/fundos iguais, topos/fundos diários intactos) e o início das zonas contrárias (OB e FVG de baixa acima, de alta abaixo). Níveis muito próximos viram um alvo só, com todos os tipos. Com `entrada` e `stop`, cada alvo na direção da operação traz o risco/retorno. É onde o preço costuma reagir pela leitura SMC, não previsão; ainda não há taxa de acerto medida.
 - **Primeira consulta de um símbolo** pode levar ~15 s (o terminal monta o histórico de timeframes como o M3); depois, menos de 1 s.
 
 ## Journal
@@ -172,6 +173,7 @@ O journal registra as operações da conta demo para medir o que funciona. **O M
 - "O Claims veio acima da previsão. Como reagiram USTEC, US30, ouro, DXY e as moedas nos primeiros 15 minutos?"
 - "Me dá o contexto entre ativos agora: dólar, ouro, índices, petróleo e BTC."
 - "Como está a estrutura do ouro no M15, H1 e H4? Londres já varreu a máxima da Ásia?"
+- "Se eu comprar o US30 em 51.250 com stop em 51.190, quais são os alvos e o risco/retorno de cada um?"
 - "Guarda as reações da semana. Como USTEC e ouro costumam reagir ao Claims acima e abaixo da previsão? Qual o tamanho da amostra?"
 - "Quantos lotes devo usar para arriscar 1% com entrada 1.0850 e stop 1.0820 no EURUSD?"
 - "Mostre os fundamentos da AAPL: receita, lucro, margem e ROE do último ano."

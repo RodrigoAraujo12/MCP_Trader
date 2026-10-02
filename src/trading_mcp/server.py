@@ -81,8 +81,10 @@ Regras de uso:
 - Estrutura SMC (`estrutura_smc`): é medição, não sinal. Apresente do timeframe maior para o menor; diga quando a
   leitura por pavio e por fechamento divergem e quando micro e macro apontam para lados diferentes. Para liquidez,
   use `niveis` (dia e semana de mercado, sessões, topos/fundos diários) e o que já foi varrido ou rompido. As
-  definições (pivôs de 5/50 candles, OB da LuxAlgo, sessões) estão em `observacoes`. Não transforme em compra ou
-  venda: a decisão de entrar é do usuário.
+  definições (pivôs de 5/50 candles, OB da LuxAlgo, sessões) estão em `observacoes`. `alvos` lista a liquidez e as
+  zonas contrárias mais próximas acima e abaixo (com risco/retorno se o usuário der entrada e stop): apresente como
+  onde o preço costuma reagir, nunca como previsão. Não transforme em compra ou venda: a decisão de entrar é do
+  usuário.
 - Journal: rode `journal_sincronizar` antes de listar, anotar ou tirar estatísticas (importa do MT5 sem
   duplicar e sem apagar anotações). Use `journal_anotar` para setup, motivo, observações e o stop inicial
   quando faltar; reaproveite os nomes de `setups_existentes`. As estatísticas vêm prontas do servidor: não
@@ -503,14 +505,17 @@ def create_server(
             list[str] | None,
             Field(description="M1, M3, M5, M15, M30, H1, H4 ou D1; vazio = M5, M15, H1 e H4"),
         ] = None,
+        entrada: Annotated[float | None, Field(gt=0, description="Preço de entrada pensado (opcional, com stop)")] = None,
+        stop: Annotated[float | None, Field(gt=0, description="Stop pensado (opcional, com entrada)")] = None,
     ) -> dict[str, Any]:
         """Estrutura de mercado no estilo SMC (só medição): topos e fundos micro e macro, BOS/CHoCH por pavio e por
         fechamento, premium/discount, FVGs abertos, order blocks, liquidez igual e varreduras por timeframe; máxima e
         mínima do dia e da semana de mercado e das sessões (Ásia, Londres, Nova York) com o que já foi varrido, e os
-        topos/fundos diários intactos.
+        topos/fundos diários intactos. `alvos`: liquidez e zonas contrárias acima e abaixo; com entrada e stop, o
+        risco/retorno de cada um.
         """
         with _tool_errors():
-            return smc.report(mt5, simbolo, timeframes or smc.DEFAULT_TIMEFRAMES)
+            return smc.report(mt5, simbolo, timeframes or smc.DEFAULT_TIMEFRAMES, entrada, stop)
 
     @server.tool(annotations=JOURNAL_SYNC)
     def reacoes_registrar() -> dict[str, Any]:

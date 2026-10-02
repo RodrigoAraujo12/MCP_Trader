@@ -565,6 +565,83 @@ def daily_swings(d1: pd.DataFrame, digits: int, price: float | None, has_forming
     return above[::-1] + below
 
 
+MAX_TARGETS = 5  # por lado
+# Níveis a menos disto (fração do preço) um do outro viram um alvo só.
+TARGET_MERGE = 0.0003
+_SESSION_NAMES = {"asia": "Ásia", "londres": "Londres", "nova_york": "Nova York"}
+
+
+def targets(levels: dict[str, Any] | None, frames: dict[str, Any], price: float | None, digits: int,
+            entry: float | None = None, stop: float | None = None) -> dict[str, Any] | None:
+    """Alvos de liquidez acima e abaixo do preço (ou da entrada): máximas/mínimas ainda não tomadas, liquidez igual,
+    topos/fundos diários intactos e o início das zonas contrárias (OB/FVG). Com entrada e stop, o risco/retorno."""
+    base = entry if entry is not None else price
+    if base is None:
+        return None
+    found: list[tuple[float, str, str]] = []  # (preço, lado, rótulo)
+
+    def add(value: Any, label: str) -> None:
+        if value is not None:
+            found.append((float(value), "acima" if value > base else "abaixo", label))
+
+    if levels:
+        for key, label in (("dia_mercado_anterior", "dia anterior"), ("semana_mercado_anterior", "semana anterior")):
+            item = levels.get(key) or {}
+            for side, word in (("maxima", "Máx."), ("minima", "Mín.")):
+                if item.get(side) is not None and not item.get(f"{side}_varrida_em") and not item.get(f"{side}_rompida_em"):
+                    add(item[side], f"{word} {label}")
+        for day_key, suffix in (("sessoes_dia_anterior", " (dia anterior)"), ("sessoes_hoje", "")):
+            for name, item in (levels.get(day_key) or {}).items():
+                if item.get("situacao") != "concluida":
+                    continue
+                for side, word in (("maxima", "Máx."), ("minima", "Mín.")):
+                    if not item.get(f"{side}_varrida_em") and not item.get(f"{side}_rompida_em"):
+                        add(item.get(side), f"{word} {_SESSION_NAMES.get(name, name)}{suffix}")
+        today = levels.get("dia_mercado_atual") or {}
+        add(today.get("maxima"), "Máx. de hoje (até agora)")
+        add(today.get("minima"), "Mín. de hoje (até agora)")
+        for swing in levels.get("topos_fundos_diarios") or []:
+            add(swing["preco"], f"{'Topo' if swing['tipo'] == 'topo' else 'Fundo'} diário de {swing['dia'][8:10]}/{swing['dia'][5:7]}")
+    for tf, info in frames.items():
+        if "estrutura" not in info:
+            continue
+        for pool in info.get("liquidez_igual", []):
+            add(pool["nivel"], f"{'Topos' if pool['tipo'] == 'topos_iguais' else 'Fundos'} iguais {tf}")
+        for kind, key in (("OB", "order_blocks"), ("FVG", "fvg_abertos")):
+            for zone in info.get(key, []):
+                if zone["direcao"] == "baixa" and zone["de"] > base:
+                    add(zone["de"], f"{kind} de baixa {tf} (início)")
+                elif zone["direcao"] == "alta" and zone["ate"] < base:
+                    add(zone["ate"], f"{kind} de alta {tf} (início)")
+
+    def side_list(side: str) -> list[dict[str, Any]]:
+        items = sorted((f for f in found if f[1] == side), key=lambda f: abs(f[0] - base))
+        merged: list[dict[str, Any]] = []
+        for value, _, label in items:
+            if merged and abs(value - merged[-1]["_v"]) <= TARGET_MERGE * base:
+                if label not in merged[-1]["tipos"]:
+                    merged[-1]["tipos"].append(label)
+                continue
+            if len(merged) == MAX_TARGETS:
+                break
+            merged.append({"_v": value, "preco": round(value, digits), "tipos": [label]})
+        for item in merged:
+            value = item.pop("_v")
+            item["distancia"] = round(value - base, digits)
+            item["distancia_pct"] = round((value / base - 1) * 100, 3)
+            if entry is not None and stop is not None and side == ("acima" if stop < entry else "abaixo"):
+                item["risco_retorno"] = round(abs(value - entry) / abs(entry - stop), 2)
+        return merged
+
+    out: dict[str, Any] = {"referencia": round(base, digits), "acima": side_list("acima"), "abaixo": side_list("abaixo")}
+    if entry is not None and stop is not None:
+        buy = stop < entry
+        out["operacao"] = {"direcao": "compra" if buy else "venda", "entrada": entry, "stop": stop,
+                           "risco": round(abs(entry - stop), digits),
+                           "alvos_na_direcao": "acima" if buy else "abaixo"}
+    return out
+
+
 def _data_warnings(frames: Sequence[pd.DataFrame]) -> list[str]:
     notes = []
     if any(not f.attrs.get("conectado", True) for f in frames):
@@ -577,12 +654,18 @@ def _data_warnings(frames: Sequence[pd.DataFrame]) -> list[str]:
     return notes
 
 
-def report(mt5: MT5Client, symbol: str, timeframes: Sequence[str] = DEFAULT_TIMEFRAMES) -> dict[str, Any]:
-    """Estrutura SMC de um símbolo em vários timeframes, com os níveis de liquidez do dia, da semana e das sessões."""
+def report(mt5: MT5Client, symbol: str, timeframes: Sequence[str] = DEFAULT_TIMEFRAMES,
+           entry: float | None = None, stop: float | None = None) -> dict[str, Any]:
+    """Estrutura SMC de um símbolo em vários timeframes, com os níveis de liquidez do dia, da semana e das sessões e
+    os alvos acima e abaixo (com risco/retorno quando ``entry`` e ``stop`` são informados)."""
     wanted = list(dict.fromkeys(tf.strip().upper() for tf in timeframes if tf.strip()))
     invalid = [tf for tf in wanted if tf not in TIMEFRAMES]
     if not wanted or invalid:
         raise ValueError(f"Timeframes aceitos: {', '.join(TIMEFRAMES)}.")
+    if (entry is None) != (stop is None):
+        raise ValueError("Para o risco/retorno, informe entrada e stop juntos.")
+    if entry is not None and entry == stop:
+        raise ValueError("O stop precisa ser diferente da entrada.")
     spec = mt5.symbol_spec(symbol)
     resolved, digits = spec["simbolo"], spec["digitos"]
     now = mt5.now_utc()
@@ -622,5 +705,12 @@ def report(mt5: MT5Client, symbol: str, timeframes: Sequence[str] = DEFAULT_TIME
         if len(df) < MACRO * 4:
             frames[tf]["aviso"] = f"Só {len(df)} candles: a estrutura macro (50 candles por pivô) fica pobre."
     result["timeframes"] = frames
+    result["alvos"] = targets(result.get("niveis"), frames, price, digits, entry, stop)
+    if result["alvos"]:
+        notes.append(
+            "Alvos = liquidez ainda não tomada (máximas/mínimas de dia, semana e sessões, topos/fundos iguais e diários "
+            "intactos) e o início das zonas contrárias (OB/FVG), onde o preço costuma reagir pela leitura SMC. Não é "
+            "previsão e ainda não há taxa de acerto medida para eles."
+        )
     result["observacoes"] = notes + _data_warnings(used)
     return result
