@@ -43,7 +43,9 @@ from trading_mcp import posicoes, risk, smc, tempo
 from trading_mcp.calendario import CalendarError, EconomicCalendar
 from trading_mcp.mt5_client import MT5Client, MT5Error
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # 2: tabela das execuções (etapa F)
+# Versão do formato assinado; independente do banco, para uma mudança de tabela não invalidar assinaturas antigas.
+SIGNATURE_VERSION = 1
 MIN_VALIDITY_MIN, MAX_VALIDITY_MIN, DEFAULT_VALIDITY_MIN = 5, 240, 30
 # Notícias de importância alta procuradas da criação até este tempo depois do fim da validade.
 NEWS_AFTER = timedelta(minutes=15)
@@ -82,6 +84,22 @@ CREATE TABLE IF NOT EXISTS propostas (
     assinatura TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS propostas_criada ON propostas (criada_utc);
+CREATE TABLE IF NOT EXISTS execucoes (
+    proposta_id TEXT PRIMARY KEY REFERENCES propostas (id),
+    iniciada_utc TEXT NOT NULL,
+    aprovacao TEXT,
+    aprovada_utc TEXT,
+    enviada_utc TEXT,
+    status TEXT NOT NULL,
+    retcode INTEGER,
+    ordem INTEGER,
+    negocio INTEGER,
+    preco REAL,
+    volume REAL,
+    mensagem TEXT,
+    requisicao TEXT,
+    resposta TEXT
+);
 """
 
 NOTES = [
@@ -89,8 +107,9 @@ NOTES = [
     "Limites em % da base do dia de mercado (17:00 de Nova York) e da semana (domingo 17:00): saldo do início mais "
     "depósitos e menos saques do período. Disponível = limite + resultado do período − perdas nos stops abertos "
     "(com o swap acumulado) e pendentes.",
-    "Lote arredondado para baixo. Ordem pendente: risco da entrada ao stop. A mercado: do preço de agora (ask na "
-    "compra, bid na venda) ao stop. Comissão, gap e escorregamento no stop não entram.",
+    "Lote arredondado para baixo. Ordem pendente: risco da entrada ao stop. A mercado: do pior preço dentro do desvio "
+    "máximo (2 spreads, mínimo 10 pontos, a partir do ask na compra e do bid na venda) ao stop. Comissão, gap e "
+    "escorregamento além do desvio não entram.",
     "Risco/retorno é a geometria da operação (distância ao alvo ÷ distância ao stop), não a chance de acerto.",
     "Propostas não reservam risco entre si: a execução (etapa F) confere os limites de novo na hora.",
 ]
@@ -242,9 +261,21 @@ def _order_type(direction: str, entry: float, quote: dict[str, Any]) -> str:
     return "venda_limitada" if entry > ref else "venda_stop"
 
 
+def market_deviation(quote: dict[str, Any], point: float) -> int:
+    """Desvio máximo de preço (pontos) aceito numa ordem a mercado: 2 spreads, no mínimo 10 pontos."""
+    spread_points = round(max(quote["ask"] - quote["bid"], 0.0) / point) if point > 0 else 0
+    return max(10, 2 * spread_points)
+
+
+def worst_market_fill(direction: str, fill: float, quote: dict[str, Any], point: float) -> float:
+    """Pior preço de uma ordem a mercado dentro do desvio máximo (acima na compra, abaixo na venda)."""
+    deviation = market_deviation(quote, point) * point
+    return fill + deviation if direction == "compra" else fill - deviation
+
+
 def _canonical(item: dict[str, Any]) -> bytes:
     """Campos assinados em JSON estável; números como float (39000 e 39000.0, lido do SQLite, assinam igual)."""
-    values: dict[str, Any] = {"schema": SCHEMA_VERSION}
+    values: dict[str, Any] = {"schema": SIGNATURE_VERSION}
     for key in _SIGNED:
         value = item[key]
         if isinstance(value, (int, float)) and not isinstance(value, bool) and key not in ("conta_login", "conta_demo"):
@@ -357,6 +388,42 @@ class ProposalStore:
         except LimitesError:
             return False
 
+    def get(self, proposal_id: str) -> dict[str, Any] | None:
+        with self._db(write=False) as conn:
+            row = conn.execute("SELECT * FROM propostas WHERE id = ?", (proposal_id,)).fetchone()
+        return None if row is None else dict(row)
+
+    # ------------------------------------------------------------------ execuções (etapa F)
+    def execution(self, proposal_id: str) -> dict[str, Any] | None:
+        with self._db(write=False) as conn:
+            if not conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'execucoes'").fetchone():
+                return None
+            row = conn.execute("SELECT * FROM execucoes WHERE proposta_id = ?", (proposal_id,)).fetchone()
+        return None if row is None else dict(row)
+
+    def start_execution(self, proposal_id: str, now: datetime, request: dict[str, Any]) -> bool:
+        """Reserva a proposta para uma única execução; False se ela já teve uma tentativa."""
+        with self._db(write=True) as conn:
+            try:
+                conn.execute(
+                    "INSERT INTO execucoes (proposta_id, iniciada_utc, status, requisicao) VALUES (?, ?, ?, ?)",
+                    (proposal_id, tempo.iso_utc(now), "aguardando_aprovacao", json.dumps(request, ensure_ascii=False)),
+                )
+            except sqlite3.IntegrityError:
+                return False
+        return True
+
+    def update_execution(self, proposal_id: str, **fields: Any) -> None:
+        allowed = {"aprovacao", "aprovada_utc", "enviada_utc", "status", "retcode", "ordem", "negocio", "preco", "volume",
+                   "mensagem", "requisicao", "resposta"}
+        unknown = set(fields) - allowed
+        if unknown:
+            raise ValueError(f"Campos desconhecidos da execução: {sorted(unknown)}")
+        values = {k: json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else v for k, v in fields.items()}
+        with self._db(write=True) as conn:
+            conn.execute(f"UPDATE execucoes SET {', '.join(f'{k} = ?' for k in values)} WHERE proposta_id = ?",
+                         (*values.values(), proposal_id))
+
     def open_risk(self, now: datetime, login: int, server: str) -> tuple[int, float]:
         """Propostas válidas e dentro do prazo da conta e o risco somado delas."""
         if not self._path.is_file():
@@ -383,6 +450,8 @@ class ProposalStore:
         clause = f"WHERE {' AND '.join(where)}" if where else ""
         with self._db(write=False) as conn:
             rows = conn.execute(f"SELECT * FROM propostas {clause} ORDER BY criada_utc DESC", params).fetchall()
+            has_exec = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'execucoes'").fetchone()
+            executions = {r["proposta_id"]: dict(r) for r in conn.execute("SELECT * FROM execucoes")} if has_exec else {}
         now_iso = tempo.iso_utc(now)
         out = []
         for r in rows[: max(1, limit)]:
@@ -395,6 +464,10 @@ class ProposalStore:
                         expira=tempo.exibicao(_parse(r["expira_utc"])), conta_demo=bool(r["conta_demo"]))
             if r["status"] == "recusada":
                 item["motivos"] = json.loads(r["motivos"])
+            done = executions.get(r["id"])
+            if done is not None:
+                item["execucao"] = {k: done[k] for k in ("status", "retcode", "ordem", "preco", "volume", "mensagem")}
+                item["situacao"] = f"execucao_{done['status']}"
             out.append(item)
         return {"total": len(rows), "propostas": out, "banco": str(self._path)}
 
@@ -480,7 +553,9 @@ def propose(
     volume = 0.0
     risk_value = loss_per_lot = None
     if not reasons:
-        loss_per_lot, _ = mt5.loss_per_lot(resolved, fill, stop)
+        # A mercado, o lote é calculado pelo pior preço dentro do desvio máximo (a execução confere do mesmo jeito).
+        sizing_fill = worst_market_fill(direction, fill, quote, spec["ponto"]) if order_type == "a_mercado" else fill
+        loss_per_lot, _ = mt5.loss_per_lot(resolved, sizing_fill, stop)
         size = risk.position_size(balance=base, risk_percent=nxt["risco_maximo"] / base * 100, loss_per_lot=loss_per_lot,
                                   volume_min=spec["volume_min"], volume_max=spec["volume_max"],
                                   volume_step=spec["volume_step"])

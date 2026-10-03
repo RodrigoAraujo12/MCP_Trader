@@ -219,15 +219,16 @@ def test_valid_pending_proposal_is_sized_stored_and_expires(tmp_path):
 def test_market_orders_are_sized_from_the_price_they_would_get(tmp_path):
     client, _ = _client(orders=())
     store = _store(tmp_path)
-    # Venda com a entrada no ask: executa no bid (1,10000); stop a 21,2 pips = 212/lote -> 0,58 lote, 122,96.
+    # Venda com a entrada no ask: executa no bid (1,10000); o lote sai do pior preço dentro do desvio (24 pontos =
+    # 2 spreads): 1,09976 até o stop 1,10212 = 23,6 pips = 236/lote -> 0,52 lote, 122,72.
     sell = limites.propose(client, store, RULES, "EURUSD", 1.10012, 1.10212)
     assert sell["tipo_ordem"] == "a_mercado" and sell["preco_execucao_estimado"] == pytest.approx(1.1)
-    assert sell["volume"] == pytest.approx(0.58) and sell["risco"] == pytest.approx(0.58 * 212)
+    assert sell["volume"] == pytest.approx(0.52) and sell["risco"] == pytest.approx(0.52 * 236)
     assert sell["risco"] <= MAX_RISK
-    # Compra com a entrada no bid: executa no ask (1,10012).
+    # Compra com a entrada no bid: executa no ask (1,10012); pior preço 1,10036.
     buy = limites.propose(client, store, RULES, "EURUSD", 1.1, 1.098)
     assert buy["tipo_ordem"] == "a_mercado" and buy["preco_execucao_estimado"] == pytest.approx(1.10012)
-    assert buy["volume"] == pytest.approx(0.58)
+    assert buy["volume"] == pytest.approx(0.52)
 
 
 def test_market_price_beyond_the_stop_is_refused(tmp_path):
@@ -452,10 +453,10 @@ def test_per_trade_limit_below_a_cent_blocks():
     assert not nxt["pode_operar"]
 
 
-def test_signature_depends_on_the_schema_version(tmp_path, monkeypatch):
+def test_signature_depends_on_the_signature_version(tmp_path, monkeypatch):
     store = _store(tmp_path)
     before = store.sign(ITEM)
-    monkeypatch.setattr(limites, "SCHEMA_VERSION", limites.SCHEMA_VERSION + 1)
+    monkeypatch.setattr(limites, "SIGNATURE_VERSION", limites.SIGNATURE_VERSION + 1)
     assert store.sign(ITEM) != before
 
 

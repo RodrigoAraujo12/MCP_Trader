@@ -1,7 +1,7 @@
 """Servidor MCP (stdio) de análise de mercado: forex e ações dos EUA.
 
-O MT5 é só lido: nenhuma tool envia, altera ou cancela ordens. As tools journal_* gravam apenas no
-arquivo local do journal.
+O MT5 é só lido, com uma exceção: `executar_proposta` envia uma proposta à conta DEMO depois da aprovação do
+usuário numa janela do Windows (e só com EXECUCAO_HABILITADA=sim no .env). Nenhuma tool altera ou cancela ordens.
 """
 
 from __future__ import annotations
@@ -20,10 +20,11 @@ from mcp_types import ToolAnnotations
 from pydantic import Field
 
 from trading_mcp import contexto_entrada, indicators, posicoes as posicoes_report, reacao, reacoes as reacoes_module
-from trading_mcp import limites, risk, smc, tempo
+from trading_mcp import aprovacao, execucao, limites, risk, smc, tempo
 from trading_mcp.calendario import CalendarError, EconomicCalendar
 from trading_mcp.config import Settings, load_settings
 from trading_mcp.journal import Journal, JournalError
+from trading_mcp.execucao import ExecucaoError
 from trading_mcp.limites import LimitesError, ProposalStore, RiskRules
 from trading_mcp.mt5_client import MT5Client, MT5Error
 from trading_mcp.reacoes import ReacoesError, ReactionStore
@@ -41,7 +42,8 @@ CALENDAR_COUNTRY = "US"
 
 INSTRUCTIONS = """\
 Servidor de dados de mercado (forex e CFDs de ações dos EUA via MetaTrader 5 / Exness; fundamentos via SEC EDGAR).
-Não existe tool para enviar ordens: o MT5 só é lido. As tools journal_* gravam apenas no journal local.
+O MT5 é só lido, exceto por `executar_proposta`: envia uma proposta à conta DEMO só depois de o usuário aprovar na
+janela do PC. As tools journal_* gravam apenas no journal local.
 
 Regras de uso:
 - Para tamanho de lote, use SEMPRE a tool `tamanho_posicao` em vez de calcular manualmente: ela usa a
@@ -103,8 +105,14 @@ Regras de uso:
   semana a partir de domingo).
   Para sugerir uma entrada, use `proposta_operacao` (não calcule lote à mão) e apresente o id, o lote, o risco, o
   tipo de ordem, a validade, as notícias e o contexto. Proposta recusada: explique o motivo e não contorne o limite
-  (nem com outro lote, stop mais curto ou tamanho_posicao). Nunca diga que uma ordem foi enviada: nenhuma tool envia
-  ordens; quem executa é o usuário.
+  (nem com outro lote, stop mais curto ou tamanho_posicao).
+- Execução (`executar_proposta`): só quando o usuário pedir explicitamente para executar uma proposta pelo id; nunca por
+  iniciativa própria nem para "testar". Só na conta demo, e quem libera é o usuário clicando em "Enviar ordem" na
+  janela que abre no PC dele (sem clique em 45 s, nada é enviado). Avise antes que a janela vai abrir. Só diga que a
+  ordem foi enviada se `status` for executada, executada_parcial ou colocada; com `falhou` (ou se a tool der erro ou
+  demorar), diga para conferir no MT5 e em `propostas_listar` antes de afirmar que nada foi enviado. Depois de um
+  "Cancelar", não proponha nem execute de novo sem o usuário pedir. Se o usuário pedir para parar, use
+  `parar_execucoes` (retomar é com ele, apagando o arquivo).
 - Os dados servem para estudo e análise; não são recomendação de investimento.
 """
 
@@ -115,6 +123,10 @@ JOURNAL_SYNC = ToolAnnotations(read_only_hint=False, destructive_hint=False, ide
 JOURNAL_WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False)
 # Lê o MT5 e o calendário e grava só no banco local das propostas (cada chamada cria uma proposta nova).
 PROPOSAL_WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=True)
+# Envia uma ordem à conta demo (depois da aprovação do usuário na janela): a única tool com efeito na corretora.
+EXECUTE = ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=False, open_world_hint=True)
+# Só cria o arquivo que bloqueia novas execuções.
+STOP = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False)
 
 
 @contextlib.contextmanager
@@ -124,7 +136,8 @@ def _tool_errors() -> Iterator[None]:
         yield
     except ToolError:
         raise
-    except (MT5Error, SecEdgarError, CalendarError, JournalError, ReacoesError, LimitesError, ValueError) as exc:
+    except (MT5Error, SecEdgarError, CalendarError, JournalError, ReacoesError, LimitesError, ExecucaoError,
+            ValueError) as exc:
         raise ToolError(str(exc)) from exc
     except Exception as exc:
         # Sem isto o modelo veria só "Error executing tool X", sem pista do que houve.
@@ -442,6 +455,26 @@ def create_server(
         with _tool_errors():
             return limites.propose(mt5, proposals, rules, simbolo, entrada, stop, alvo, validade_min, calendar,
                                    entry_labels)
+
+    @server.tool(annotations=EXECUTE)
+    def executar_proposta(
+        proposta_id: Annotated[str, Field(description="id da proposta (de proposta_operacao)")],
+    ) -> dict[str, Any]:
+        """Envia uma proposta válida à conta DEMO, só se o usuário clicar em "Enviar ordem" na janela que abre no PC dele
+        (até 45 s).
+        Use somente quando o usuário pedir para executar essa proposta. Cada proposta tem uma única tentativa."""
+        with _tool_errors():
+            return execucao.execute(mt5, proposals, rules, proposta_id, enabled=settings.execution_enabled,
+                                    approve=aprovacao.ask_windows)
+
+    @server.tool(annotations=STOP)
+    def parar_execucoes(
+        motivo: Annotated[str, Field(description="Motivo (opcional)")] = "",
+    ) -> dict[str, Any]:
+        """Para todas as novas execuções (cria o arquivo PARAR_EXECUCOES). Não mexe em ordens nem posições abertas.
+        Só o usuário retoma, apagando o arquivo."""
+        with _tool_errors():
+            return execucao.stop_all(proposals, motivo, mt5.now_utc())
 
     @server.tool(annotations=JOURNAL_READ)
     def propostas_listar(

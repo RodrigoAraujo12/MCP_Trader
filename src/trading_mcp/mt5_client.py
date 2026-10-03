@@ -1,4 +1,4 @@
-"""Cliente somente leitura do MetaTrader 5 (thread-safe, conexão preguiçosa)."""
+"""Cliente do MetaTrader 5 (thread-safe, conexão preguiçosa): leitura; envio de ordens só pelo caminho da etapa F."""
 
 from __future__ import annotations
 
@@ -8,13 +8,14 @@ import re
 import threading
 import time
 from collections.abc import Callable
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
 
 from trading_mcp import risk, tempo
-from trading_mcp.config import Settings
+from trading_mcp.config import KILL_FILE_NAME, Settings
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +58,10 @@ _ALLOWED_CALLS = frozenset(
         "history_orders_get",
     }
 )
+
+# Únicas funções que enviam algo ao servidor da corretora; só pelos métodos check_order/send_order, que exigem
+# a execução habilitada no .env e a conta demo, conferidas a cada chamada.
+_TRADE_CALLS = frozenset({"order_check", "order_send"})
 
 _WARMUP_TIMEOUT_S = 10.0
 _WARMUP_STEP_S = 0.5
@@ -131,7 +136,7 @@ class _ReadOnlyModule:
     def __getattr__(self, name: str) -> Any:
         if name in _ALLOWED_CALLS or (name[:1].isalpha() and name == name.upper()):
             return getattr(object.__getattribute__(self, "_raw"), name)
-        raise MT5Error(f"Operação não permitida (servidor somente leitura): {name}")
+        raise MT5Error(f"Operação não permitida por este caminho (só leitura): {name}")
 
 
 def _guard(func: Callable[..., Any]) -> Callable[..., Any]:
@@ -483,6 +488,8 @@ class MT5Client:
                 "moeda_lucro": i.currency_profit,
                 "moeda_margem": i.currency_margin,
                 "is_forex": self._is_forex(i),
+                "modo_preenchimento": getattr(i, "filling_mode", 0),
+                "modos_expiracao": getattr(i, "expiration_mode", 0),
             }
 
     # ------------------------------------------------------------------ mercado
@@ -841,6 +848,43 @@ class MT5Client:
                 "build": getattr(t, "build", None),
                 "max_barras_grafico": getattr(t, "maxbars", None),
             }
+
+    # ------------------------------------------------------------------ ordens (etapa F)
+    def _trade(self, name: str, request: dict[str, Any], account: tuple[int, str]) -> Any:
+        """order_check/order_send no módulo original, conferindo agora: execução habilitada, sem o arquivo de parada,
+        a conta ``account`` (login, servidor) da proposta logada no terminal e conta demo."""
+        if name not in _TRADE_CALLS:
+            raise MT5Error(f"Operação de negociação desconhecida: {name}")
+        if not self._settings.execution_enabled:
+            raise MT5Error("Execução desativada (EXECUCAO_HABILITADA no .env não é 'sim'): nenhuma ordem é enviada.")
+        if (Path(self._settings.propostas_path).parent / KILL_FILE_NAME).exists():
+            raise MT5Error(f"Execuções paradas (arquivo {KILL_FILE_NAME}): nada foi enviado.")
+        with self._lock:
+            self.ensure_connected()  # lê a conta de novo e atualiza o tipo de conta
+            snapshot = self._account_snapshot
+            if (getattr(snapshot, "login", None), getattr(snapshot, "server", None)) != tuple(account):
+                raise MT5Error("O terminal está em outra conta, diferente da conta da proposta. Nada foi enviado.")
+            if self._account_kind() != "demo":
+                raise MT5Error("Ordens só na conta demo: a conta conectada não é demo. Nada foi enviado.")
+            raw = object.__getattribute__(self._module(), "_raw")
+            try:
+                return getattr(raw, name)(request)
+            except Exception as exc:  # noqa: BLE001 - a extensão em C pode lançar qualquer coisa
+                raise MT5Error(f"Erro do MetaTrader 5 em {name}() ({type(exc).__name__}): {exc}") from exc
+
+    def constant(self, name: str) -> int:
+        """Constante do módulo MetaTrader5 (ex.: TRADE_ACTION_DEAL)."""
+        if not (name[:1].isalpha() and name == name.upper()):
+            raise ValueError(f"Constante inválida: {name}")
+        return getattr(self._module(), name)
+
+    def check_order(self, request: dict[str, Any], account: tuple[int, str]) -> Any:
+        """Validação da ordem pelo servidor, sem enviar (MqlTradeCheckResult; retcode 0 = aceita)."""
+        return self._trade("order_check", request, account)
+
+    def send_order(self, request: dict[str, Any], account: tuple[int, str]) -> Any:
+        """Envia a ordem (MqlTradeResult). Só a etapa F chama, depois da aprovação do usuário."""
+        return self._trade("order_send", request, account)
 
     @_guard
     def terminal_data_path(self) -> str:

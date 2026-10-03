@@ -20,6 +20,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_JOURNAL_PATH = Path.home() / "trading-mcp" / "journal.sqlite3"
 DEFAULT_REACOES_PATH = Path.home() / "trading-mcp" / "reacoes.sqlite3"
 DEFAULT_PROPOSTAS_PATH = Path.home() / "trading-mcp" / "propostas.sqlite3"
+# Arquivo que, na pasta do banco das propostas, bloqueia toda execução de ordens (só o usuário o apaga).
+KILL_FILE_NAME = "PARAR_EXECUCOES"
 # Regras de risco do usuário: % do saldo do início do dia (por operação e por dia) e da semana de mercado.
 DEFAULT_RISK_PER_TRADE_PCT, DEFAULT_DAILY_LOSS_PCT, DEFAULT_WEEKLY_LOSS_PCT = 1.25, 5.0, 25.0
 # Cópias e CSVs são arquivos fechados: dentro do projeto, o OneDrive os leva para a nuvem.
@@ -130,6 +132,8 @@ class Settings:
     risk_per_trade_pct: float = DEFAULT_RISK_PER_TRADE_PCT
     daily_loss_pct: float = DEFAULT_DAILY_LOSS_PCT
     weekly_loss_pct: float = DEFAULT_WEEKLY_LOSS_PCT
+    # Execução de propostas (etapa F): desligada por padrão; só na conta demo e com aprovação do usuário numa janela.
+    execution_enabled: bool = False
     # Arquivo .env efetivamente usado (None = nenhum encontrado).
     env_file: str | None = None
     # Problemas encontrados na configuração do MT5.
@@ -175,6 +179,11 @@ def load_settings(env_file: Path | None = None) -> Settings:
         )
         per_trade, daily, weekly = DEFAULT_RISK_PER_TRADE_PCT, DEFAULT_DAILY_LOSS_PCT, DEFAULT_WEEKLY_LOSS_PCT
 
+    raw_execution = (_get(env, "EXECUCAO_HABILITADA") or "nao").strip().lower()
+    if raw_execution not in ("sim", "nao", "não"):
+        errors.append(f"EXECUCAO_HABILITADA deve ser sim ou nao, recebido: {raw_execution!r}")
+    execution_enabled = raw_execution == "sim"
+
     raw_instruments = _get(env, "INSTRUMENTOS")
     instruments = (
         tuple(dict.fromkeys(i.strip().upper() for i in raw_instruments.split(",") if i.strip()))
@@ -199,6 +208,7 @@ def load_settings(env_file: Path | None = None) -> Settings:
         risk_per_trade_pct=per_trade,
         daily_loss_pct=daily,
         weekly_loss_pct=weekly,
+        execution_enabled=execution_enabled,
         env_file=str(env_file) if env_file.is_file() else None,
         errors=tuple(errors),
     )

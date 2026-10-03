@@ -2,7 +2,7 @@
 
 Servidor MCP (stdio) de análise de mercado para forex e ações dos EUA. Dá ao Claude acesso a cotações, histórico e indicadores técnicos via MetaTrader 5 (Exness), a um calculador de tamanho de posição que usa a especificação real do contrato na corretora, e a fundamentos de empresas americanas via SEC EDGAR.
 
-**MT5 somente leitura**: não existe tool para enviar, alterar ou cancelar ordens, e o acesso a essas funções do MetaTrader 5 é bloqueado no código. As únicas gravações são no journal local (um arquivo SQLite no seu computador).
+**MT5 só lido, com uma exceção controlada**: a única tool que envia ordem é `executar_proposta`, e só na conta **demo**, só com `EXECUCAO_HABILITADA=sim` no `.env` e só depois de você clicar em "Enviar ordem" numa janela do Windows com os dados exatos da ordem. Nenhuma tool altera ou cancela ordens. As demais gravações são em bancos SQLite locais (journal, reações, propostas).
 
 ## Como você usa: interface ou terminal?
 
@@ -63,6 +63,7 @@ Copy-Item .env.example .env
 | `PERDA_MAXIMA_DIA_PCT` | Perda máxima no dia de mercado, em % da base do dia | Não (padrão: 5) |
 | `PERDA_MAXIMA_SEMANA_PCT` | Perda máxima na semana de mercado, em % da base da semana | Não (padrão: 25) |
 | `PROPOSTAS_PATH` | Banco das propostas de operação (SQLite) | Não (padrão: `trading-mcp\propostas.sqlite3` na pasta do seu usuário) |
+| `EXECUCAO_HABILITADA` | `sim` permite `executar_proposta` (só conta demo, com aprovação na janela) | Não (padrão: `nao`) |
 
 O `.env` é lido da pasta raiz do projeto, mesmo que o servidor seja iniciado de outro lugar (`TRADING_MCP_ENV_FILE` aponta para outro arquivo, se preferir). Arquivos salvos pelo Bloco de Notas (com BOM ou UTF-16) funcionam. O `.env` está no `.gitignore` e nunca deve ir para o git.
 
@@ -73,7 +74,7 @@ Use uma instalação **separada** do MT5, logada **só** na conta demo, e aponte
 - Se `MT5_LOGIN` estiver preenchido, `MT5_PATH` passa a ser obrigatório. Sem ele, o login seria feito no seu terminal principal e trocaria a conta logada nele. O servidor recusa essa combinação.
 - A cada uso, o servidor confere a conta logada contra `MT5_LOGIN` e `MT5_SERVER`. Com qualquer uma delas preenchida, o par conta/servidor da primeira conexão fica congelado, mesmo depois de o terminal reiniciar: se alguém trocar a conta, as ferramentas ficam bloqueadas até ele voltar para a conta original. Enquanto o terminal está aberto, o servidor não reloga sozinho; se o terminal reiniciar, a reconexão pede o login de `MT5_LOGIN`/`MT5_SERVER` (com as duas preenchidas, volta à conta do `.env`). Sem essas variáveis, a troca é aceita, mas o cache de símbolos é limpo.
 - Se o terminal perder a conexão com a corretora, as cotações saem com `estado = "desconectado"` em vez de parecerem atuais, e `historico`/`indicadores` avisam que os candles recentes podem faltar.
-- O acesso à biblioteca MetaTrader5 passa por uma lista de funções permitidas, todas de leitura. Isso evita chamadas acidentais neste código, mas não é uma barreira de segurança: a proteção real é não existir nenhuma tool de ordens.
+- O acesso à biblioteca MetaTrader5 passa por uma lista de funções permitidas, todas de leitura. Só `order_check` e `order_send` ficam fora dela, num caminho próprio que confere, a cada chamada, a execução habilitada no `.env` e a conta demo. A lista evita chamadas acidentais, mas não é a barreira principal: a principal é o seu clique na janela de aprovação.
 - Camada extra no próprio terminal: em **Ferramentas → Opções → Expert Advisors**, marque **"Desativar negociação automática via API Python externa"** e deixe o botão Algo Trading desligado. A leitura continua funcionando; `info_conta` mostra as duas travas.
 - A ferramenta `info_conta` avisa se a conta conectada não for demo ou não estiver fixada no `.env`.
 
@@ -87,7 +88,9 @@ Use uma instalação **separada** do MT5, logada **só** na conta demo, e aponte
 | `tamanho_posicao` | Lote para arriscar X% do saldo (cálculo livre; para os seus limites, use `proposta_operacao`) | `simbolo`, `entrada`, `stop`, `risco_percentual` (padrão: o seu limite por operação, 1,25%), `saldo` (padrão: saldo da conta) |
 | `risco_conta` | Seus limites agora: saldo do início do dia e da semana de mercado, resultado, perda nos stops abertos e pendentes, quanto ainda cabe e o risco máximo da próxima operação | — |
 | `proposta_operacao` | Proposta pelas suas regras (não envia ordem): lote, risco, tipo de ordem, risco/retorno, notícias na validade, contexto SMC; recusa com o motivo se estourar um limite | `simbolo`, `entrada`, `stop`, `alvo` (opcional), `validade_min` (5–240, padrão 30) |
-| `propostas_listar` | Propostas guardadas e a situação (válida, expirada ou recusada) | `dias` (padrão 7), `simbolo`, `limite` |
+| `propostas_listar` | Propostas guardadas e a situação (válida, expirada, recusada ou o resultado da execução) | `dias` (padrão 7), `simbolo`, `limite` |
+| `executar_proposta` | Envia uma proposta válida à conta **demo**, só se você aprovar na janela do Windows (até 45 s) | `proposta_id` |
+| `parar_execucoes` | Bloqueia todas as novas execuções (cria o arquivo `PARAR_EXECUCOES`; só você retoma, apagando-o) | `motivo` (opcional) |
 | `info_conta` | Saldo, margem, posições abertas e travas de negociação do terminal | — |
 | `posicoes` | Posições abertas e ordens pendentes: estado da cotação, distância até stop e alvo, resultado se forem atingidos, duração e exposição por símbolo | `simbolo` (vazio = todos), `incluir_pendentes` (padrão: sim) |
 | `simbolos` | Busca símbolos disponíveis na conta | `busca` (ex.: USD, Apple), `limite` (1–200, padrão 30) |
@@ -189,6 +192,18 @@ As suas regras: **1,25% por operação, 5% de perda no dia e 25% na semana**, so
 - **Nada é enviado**: proposta não é ordem. Cada uma fica guardada com validade (padrão 30 min) e uma assinatura HMAC dos parâmetros exatos (conta, símbolo, direção, tipo, entrada, stop, alvo, lote, risco, validade, situação), com a chave num arquivo ao lado do banco (`propostas.chave`). A etapa F só poderá executar, na conta demo, uma proposta válida, íntegra, dentro do prazo e aprovada por você fora do chat, conferindo os limites de novo na hora: propostas não reservam risco entre si (avisa quando as válidas somadas passariam do espaço).
 - **Fora da conta**: comissão, gap e escorregamento no stop. Risco/retorno é a geometria da operação, não a chance de acerto.
 
+## Execução na conta demo
+
+`executar_proposta` envia uma proposta de `proposta_operacao` à conta demo. Antes, é preciso: `EXECUCAO_HABILITADA=sim` no `.env` (e reiniciar o Claude Desktop), o botão **Algo Trading** ligado no MT5 e, em Ferramentas → Opções → Expert Advisors, desmarcar "Desativar negociação algorítmica via API Python externa".
+
+1. **Travas antes da janela**: uma execução por vez; execução habilitada e sem o arquivo `PARAR_EXECUCOES` (na pasta do banco das propostas); proposta íntegra (assinatura confere), válida, a pelo menos 15 s de expirar e sem tentativa anterior; a mesma conta da proposta, demo, conectada; Algo Trading e API Python liberados; cotação atual; o preço de agora dá o mesmo tipo de ordem (uma compra limitada cujo preço já passou viraria compra a mercado: recusada); o risco com o lote assinado (a mercado, com o desvio máximo de preço) cabe nos limites de agora.
+2. **Janela**: abre no seu PC com a conta, a proposta, o símbolo, a direção, o tipo, o lote, a entrada (a mercado: o preço de agora e o risco máximo com o desvio), o stop, o alvo, o risco, quando a ordem pendente expira, as notícias perto e a validade. Só um **clique com o botão esquerdo do mouse** em "Enviar ordem", depois de 2 s, aprova: teclado nenhum aprova (o botão não tem letra de atalho, não para no Tab e, se receber o foco pelas setas, o foco volta para "Cancelar"; Enter e Esc cancelam). O servidor espera o clique por até 45 s (ou até 15 s antes de a proposta expirar); sem clique, a janela fecha e nada é enviado.
+3. **Depois do clique**: as travas da proposta, da conta, do terminal, do preço e dos limites de novo (o preço andou durante a espera) e a validação no servidor da corretora (`order_check`, trocando o modo de preenchimento só quando o servidor recusa o modo). Imediatamente antes do envio, o arquivo de parada e a validade mais uma vez; o próprio cliente do MT5 confere de novo a execução habilitada, o arquivo de parada, a conta da proposta e a conta demo. A ordem leva o comentário `mcp <id da proposta>`; a pendente expira junto com a proposta.
+4. **Registro**: cada proposta tem **uma única tentativa** (recusada, sem resposta, abortada, com falha ou enviada); para tentar de novo, faça uma nova proposta. Antes do envio a execução fica como `enviando`, com a requisição; depois, o resultado (código da corretora, ticket, preço) aparece em `propostas_listar`, e o servidor confere se a ordem ou a posição apareceu no terminal. Com `falhou`, confira no MT5.
+5. **Parar**: `parar_execucoes` (ou criar o arquivo à mão) bloqueia todas as novas execuções, inclusive uma que esteja esperando o clique. Ordens e posições já abertas continuam no MT5. Só você retoma, apagando o arquivo.
+
+A mercado, o lote da proposta já é calculado pelo pior preço dentro do desvio (2 spreads, mínimo 10 pontos). Na conta Standard da Exness a execução é a mercado e a corretora pode executar com escorregamento além disso; comissão e escorregamento no stop não entram no risco.
+
 ## Exemplos de perguntas
 
 - "Como está o USTEC agora? A cotação é atual?"
@@ -280,7 +295,7 @@ Os testes usam um MT5 simulado; não precisam do terminal:
 src/trading_mcp/
 ├── server.py          # Servidor MCP e definição das ferramentas
 ├── config.py          # Leitura do .env e das variáveis de ambiente
-├── mt5_client.py      # Cliente MetaTrader 5 (somente leitura, identidade da conta, estado das cotações)
+├── mt5_client.py      # Cliente MetaTrader 5 (leitura, identidade da conta, estado das cotações; envio só demo)
 ├── tempo.py           # Base de tempo: UTC, exibição em São Paulo e Nova York, fim de candle
 ├── calendario.py      # Calendário econômico (lê o arquivo do serviço MQL5)
 ├── posicoes.py        # Relatório de posições e ordens pendentes
@@ -291,7 +306,9 @@ src/trading_mcp/
 ├── smc.py             # Estrutura SMC: topos/fundos, BOS/CHoCH, FVG, order blocks, liquidez, sessões
 ├── indicators.py      # Indicadores técnicos
 ├── risk.py            # Tamanho de posição e arredondamento de lote
-├── limites.py         # Limites de risco do usuário e propostas de operação (sem envio)
+├── limites.py         # Limites de risco do usuário e propostas de operação
+├── execucao.py        # Execução de propostas na conta demo (travas, janela, order_check/order_send)
+├── aprovacao.py       # Janela de aprovação do Windows (o clique do usuário libera a ordem)
 └── sec_edgar.py       # Fundamentos da SEC EDGAR
 
 tests/
@@ -325,12 +342,12 @@ mql5/Services/
 
 ## Roadmap
 
-Revisado em 2026-10-01. Tudo continua somente leitura até a etapa F.
+Revisado em 2026-10-02.
 
 - **A** (feito): base validada no MT5 real (identidade da conta, horários em UTC, estado da cotação).
 - **B** (feito): calendário econômico (B2), consulta de posições com distâncias e risco até o stop (B1) e journal em SQLite importado do MT5 (B3).
 - **C**: reação observada a eventos e contexto entre ativos para os instrumentos operados (C1) e reações guardadas para estatísticas por tipo de surpresa (C2), ambas feitas. Próximo: notícias, só depois de medir a latência das fontes gratuitas.
 - **D**: o SMC do usuário é discricionário (sem setup fixo), então a etapa virou ferramentas de estrutura (D1: `estrutura_smc`, feito) e o contexto SMC de cada operação no journal (D2, feito: sessão, estrutura, CHoCH, varredura, OB/FVG, premium/discount, medidos sozinhos na hora da entrada, mais as tags do usuário) para medir quais combinações funcionam. Backtest só de uma variante que os dados indicarem.
 - **E**: painel dos limites do usuário (1,25% / 5% / 25% sobre o saldo do início do dia e da semana de mercado) e propostas de operação guardadas com validade e assinatura, sem envio (feito). A aprovação fora do chat entra com a execução, na F.
-- **F**: execução **somente em conta demo**, com verificação de conta imediatamente antes do envio, reconciliação e kill switch.
+- **F**: execução **somente em conta demo**, com aprovação do usuário numa janela do Windows, verificação de conta, preço e limites imediatamente antes do envio, reconciliação e kill switch (feito; primeiro teste real com o mercado aberto).
 - **G**: coleta contínua, alertas ou dashboard, só se o uso justificar.

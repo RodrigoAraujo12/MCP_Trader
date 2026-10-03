@@ -30,10 +30,13 @@ EXPECTED_TOOLS = {
     "cotacao", "historico", "indicadores", "tamanho_posicao", "info_conta", "posicoes", "simbolos", "calendario",
     "fundamentos", "reacao_evento", "contexto_mercado", "journal_sincronizar", "journal_anotar", "journal_listar", "journal_estatisticas", "journal_exportar",
     "reacoes_registrar", "reacoes_estatisticas", "estrutura_smc", "risco_conta", "proposta_operacao",
-    "propostas_listar",
+    "propostas_listar", "executar_proposta", "parar_execucoes",
 }
 # Gravam só nos bancos locais (journal, reações e propostas); todas as demais são somente leitura.
-JOURNAL_WRITERS = {"journal_sincronizar", "journal_anotar", "journal_exportar", "reacoes_registrar", "proposta_operacao"}
+JOURNAL_WRITERS = {"journal_sincronizar", "journal_anotar", "journal_exportar", "reacoes_registrar", "proposta_operacao",
+                   "parar_execucoes"}
+# A única com efeito na corretora (conta demo, depois da aprovação do usuário na janela).
+BROKER_WRITERS = {"executar_proposta"}
 
 
 @pytest.fixture
@@ -132,7 +135,9 @@ async def test_only_journal_tools_write_and_none_is_destructive() -> None:
     assert {t.name for t in tools} == EXPECTED_TOOLS
     for tool in tools:
         assert tool.annotations is not None and tool.description
-        if tool.name in JOURNAL_WRITERS:
+        if tool.name in BROKER_WRITERS:
+            assert tool.annotations.read_only_hint is False and tool.annotations.destructive_hint is True
+        elif tool.name in JOURNAL_WRITERS:
             assert tool.annotations.read_only_hint is False and tool.annotations.destructive_hint is False
         else:
             assert tool.annotations.read_only_hint is True

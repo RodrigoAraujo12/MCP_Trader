@@ -32,6 +32,9 @@ TICK_DTYPE = np.dtype(
 ORDER_TYPE_BUY_LIMIT, ORDER_TYPE_SELL_LIMIT, ORDER_TYPE_BUY_STOP, ORDER_TYPE_SELL_STOP = 2, 3, 4, 5
 ORDER_TYPE_BUY_STOP_LIMIT, ORDER_TYPE_SELL_STOP_LIMIT, ORDER_TYPE_CLOSE_BY = 6, 7, 8
 ORDER_TIME_GTC, ORDER_TIME_DAY, ORDER_TIME_SPECIFIED, ORDER_TIME_SPECIFIED_DAY = 0, 1, 2, 3
+TRADE_ACTION_DEAL, TRADE_ACTION_PENDING = 1, 5
+ORDER_FILLING_FOK, ORDER_FILLING_IOC, ORDER_FILLING_RETURN = 0, 1, 2
+TRADE_RETCODE_PLACED, TRADE_RETCODE_DONE, TRADE_RETCODE_DONE_PARTIAL, TRADE_RETCODE_INVALID_FILL = 10008, 10009, 10010, 10030
 POSITION_TYPE_BUY, POSITION_TYPE_SELL = 0, 1
 DEAL_TYPE_BUY, DEAL_TYPE_SELL, DEAL_TYPE_BALANCE, DEAL_TYPE_CREDIT, DEAL_TYPE_CHARGE = 0, 1, 2, 3, 4
 DEAL_ENTRY_IN, DEAL_ENTRY_OUT, DEAL_ENTRY_INOUT, DEAL_ENTRY_OUT_BY = 0, 1, 2, 3
@@ -89,6 +92,8 @@ def make_symbol(
     currency_profit: str = "USD",
     currency_margin: str = "EUR",
     trade_calc_mode: int = SYMBOL_CALC_MODE_FOREX,
+    filling_mode: int = 3,
+    expiration_mode: int = 15,
 ) -> Record:
     return Record(
         name=name,
@@ -111,6 +116,8 @@ def make_symbol(
         currency_profit=currency_profit,
         currency_margin=currency_margin,
         trade_calc_mode=trade_calc_mode,
+        filling_mode=filling_mode,
+        expiration_mode=expiration_mode,
     )
 
 
@@ -246,6 +253,10 @@ class FakeMT5:
         tradeapi_disabled: bool = False,
         now: Callable[[], float] | None = None,
         tick_age_s: dict[str, float] | None = None,
+        trading: bool = False,
+        unsupported_fillings: set[int] | None = None,
+        send_retcode: int | None = None,
+        check_retcode: int | None = None,
     ) -> None:
         # Copia as constantes do módulo para a instância (para `mt5.TIMEFRAME_H1` etc.).
         for key, value in globals().items():
@@ -286,6 +297,14 @@ class FakeMT5:
         self.initialized = False
         self.initialize_calls: list[dict[str, Any]] = []
         self.calc_profit_returns_none = False
+        # Negociação (etapa F): desligada, order_check/order_send continuam proibidos (AssertionError).
+        self.trading = trading
+        self.algo_trading = trading  # botão Algo Trading do terminal
+        self.unsupported_fillings: set[int] = set(unsupported_fillings or ())
+        self.send_retcode = send_retcode
+        self.check_retcode = check_retcode
+        self.checked: list[dict[str, Any]] = []
+        self.sent: list[dict[str, Any]] = []
         self._last_error: tuple[int, str] = (1, "Success")
 
     # --- conexão ---------------------------------------------------------
@@ -315,7 +334,7 @@ class FakeMT5:
         connected = self.connected and self.terminal_polls > self.connect_after_polls
         return Record(
             connected=connected,
-            trade_allowed=False,
+            trade_allowed=self.algo_trading,
             tradeapi_disabled=self.tradeapi_disabled,
             maxbars=self.maxbars,
             data_path=self.data_path,
@@ -466,8 +485,36 @@ class FakeMT5:
         return tuple(o for o in self.history_orders if lo <= o.time_setup <= hi)
 
     # --- proibido na fase 1 ---------------------------------------------
-    def order_send(self, *args: Any, **kwargs: Any):
-        raise AssertionError("order_send nunca pode ser chamado: a fase 1 é somente leitura")
+    def order_check(self, request: dict[str, Any] | None = None, *args: Any, **kwargs: Any):
+        if not self.trading:
+            raise AssertionError("order_check não é usado fora da etapa F (trading=False)")
+        self.checked.append(dict(request or {}))
+        if (request or {}).get("type_filling") in self.unsupported_fillings:
+            return Record(retcode=TRADE_RETCODE_INVALID_FILL, comment="Unsupported filling mode", balance=0.0,
+                          equity=0.0, margin=0.0, margin_free=0.0, margin_level=0.0, profit=0.0, request=request)
+        if self.check_retcode is not None:
+            return Record(retcode=self.check_retcode, comment="Refused", balance=0.0, equity=0.0, margin=0.0,
+                          margin_free=0.0, margin_level=0.0, profit=0.0, request=request)
+        return Record(retcode=0, comment="Done", balance=self.balance, equity=self.balance, margin=0.0,
+                      margin_free=self.balance, margin_level=0.0, profit=0.0, request=request)
 
-    def order_check(self, *args: Any, **kwargs: Any):
-        raise AssertionError("order_check não é usado na fase 1")
+    def order_send(self, request: dict[str, Any] | None = None, *args: Any, **kwargs: Any):
+        if not self.trading:
+            raise AssertionError("order_send nunca pode ser chamado fora da etapa F (trading=False)")
+        request = dict(request or {})
+        self.sent.append(request)
+        pending = request.get("action") == TRADE_ACTION_PENDING
+        retcode = self.send_retcode or (TRADE_RETCODE_PLACED if pending else TRADE_RETCODE_DONE)
+        ticket = 900_000 + len(self.sent)
+        ok = retcode in (TRADE_RETCODE_PLACED, TRADE_RETCODE_DONE, TRADE_RETCODE_DONE_PARTIAL)
+        if ok and pending:
+            self.orders.append(make_order(ticket, request["symbol"], request["type"], request["volume"], request["price"],
+                                          request["price"], sl=request.get("sl", 0.0), tp=request.get("tp", 0.0)))
+        elif ok:
+            side = "buy" if request["type"] == ORDER_TYPE_BUY else "sell"
+            self.positions.append(make_position(ticket, request["symbol"], side, request["volume"], request["price"],
+                                                request["price"], sl=request.get("sl", 0.0), tp=request.get("tp", 0.0)))
+        return Record(retcode=retcode, deal=0 if pending or not ok else 800_000 + len(self.sent),
+                      order=ticket if ok else 0, volume=request.get("volume", 0.0), price=request.get("price", 0.0),
+                      bid=0.0, ask=0.0, comment="Request executed" if ok else "Rejected", request_id=len(self.sent),
+                      retcode_external=0, request=request)
