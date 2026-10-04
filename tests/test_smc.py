@@ -318,6 +318,40 @@ def test_report_with_fake_terminal():
         assert item["por_pavio"] or item["por_fechamento"]
 
 
+def _index_with_stale_first_read(stale_reads: int):
+    """USTECm com uma máxima às 11:30; nas primeiras leituras o terminal só tem o histórico guardado até 10:55."""
+    rates = _random_walk(4100)
+    spike = len(rates) - 6  # 11:30 (o último candle abre 11:55)
+    rates["high"][spike] = rates["high"].max() + 100
+    index = make_symbol("USTECm", digits=2, point=0.01, bid=30000.0, ask=30001.12, trade_calc_mode=fm.SYMBOL_CALC_MODE_CFD,
+                        currency_base="USD", currency_profit="USD")
+    stored = rates[:-12].copy()
+    fake = FakeMT5([index], rates={"USTECm": rates})
+    copy = fake.copy_rates_from_pos
+
+    def syncing(symbol, timeframe, start_pos, count):
+        data = copy(symbol, timeframe, start_pos, count)  # conta a leitura
+        return stored[-count:].copy() if fake.rates_calls <= stale_reads else data
+
+    fake.copy_rates_from_pos = syncing
+    return make_client(fake)[0], float(rates["high"][spike])
+
+
+def test_report_levels_wait_for_terminal_sync():
+    # 04/10/2026: o 1º pedido (o M5 dos níveis) veio parado antes da máxima do dia e a "máx. de hoje" saiu abaixo do
+    # preço; os pedidos seguintes (os timeframes) já vinham sincronizados.
+    client, day_high = _index_with_stale_first_read(1)
+    out = smc.report(client, "USTEC", ["M5"])
+    assert out["niveis"]["dia_mercado_atual"]["maxima"] == pytest.approx(day_high)
+    assert not any("Faltam os candles" in n for n in out["observacoes"])
+
+
+def test_report_warns_when_candles_stay_behind():
+    client, _ = _index_with_stale_first_read(1_000)
+    out = smc.report(client, "USTEC", ["M5"])
+    assert any("Faltam os candles mais recentes" in n for n in out["observacoes"])
+
+
 def test_report_rejects_unknown_timeframe():
     client, _ = make_client(FakeMT5([make_symbol("EURUSD")], rates={"EURUSD": _random_walk(300)}))
     with pytest.raises(ValueError, match="Timeframes aceitos"):

@@ -449,6 +449,22 @@ async def test_historico_and_indicadores_warn_when_disconnected() -> None:
 
 
 @pytest.mark.anyio
+async def test_historico_warns_when_terminal_has_not_synced(monkeypatch) -> None:
+    import time
+
+    from trading_mcp import mt5_client
+
+    monkeypatch.setattr(mt5_client, "_SYNC_RETRY_S", 0.0)
+    n = 1500
+    start = int(time.time()) - (n - 1) * 3600 - 2 * 3600  # o último H1 terminou há 1 h, com ticks de agora
+    fake = _fake_mt5()
+    fake.rates["EURUSDm"] = make_rates(_random_walk(n), start_time=start)
+    async with Client(_server(fake)) as client:
+        hist = _payload(await client.call_tool("historico", {"simbolo": "EURUSD", "quantidade": 5}))
+    assert any("Faltam os candles mais recentes" in w for w in hist["avisos"])
+
+
+@pytest.mark.anyio
 async def test_indicadores_flags_forming_candle() -> None:
     import time
 

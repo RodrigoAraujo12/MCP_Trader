@@ -325,6 +325,45 @@ def test_rates_report_connection_state():
     assert client.rates("EURUSD", "H1", 3).attrs["conectado"] is False
 
 
+def _syncing_client(stale_calls: int):
+    """Candles M5 até 12:00 (agora); nas primeiras ``stale_calls`` leituras o terminal só tem os guardados até 11:00."""
+    now = FakeClock().now
+    start = int(now.timestamp()) - 24 * 300
+    full = make_rates([1.10] * 25, start_time=start, step_seconds=300)
+    stored = full[full["time"] <= start + 12 * 300]
+    fake = FakeMT5([make_symbol("EURUSD")], rates={"EURUSD": full})
+    copy = fake.copy_rates_from_pos
+
+    def syncing(symbol, timeframe, start_pos, count):
+        data = copy(symbol, timeframe, start_pos, count)  # conta a leitura
+        return stored[-count:].copy() if fake.rates_calls <= stale_calls else data
+
+    fake.copy_rates_from_pos = syncing
+    return make_client(fake)
+
+
+def test_rates_wait_for_terminal_to_sync_recent_candles():
+    # Sem esperar, sairia o candle das 11:00 guardado (e parcial) como se fosse o último fechado.
+    client, fake = _syncing_client(stale_calls=2)
+    df = client.rates("EURUSD", "M5", 10, include_current=False)
+    assert df["time"].iloc[-1] == pd.Timestamp("2026-09-30 11:55", tz="UTC")
+    assert df.attrs["defasado"] is False
+    assert client.clock.sleeps == [0.5, 0.5] and fake.rates_calls == 3
+
+
+def test_rates_flag_candles_still_behind_after_waiting():
+    client, fake = _syncing_client(stale_calls=100)
+    df = client.rates("EURUSD", "M5", 10)
+    assert df["time"].iloc[-1] == pd.Timestamp("2026-09-30 11:00", tz="UTC")
+    assert df.attrs["defasado"] is True and fake.rates_calls == 11  # 1 leitura + 10 esperas
+
+
+def test_rates_in_sync_do_not_wait():
+    client, fake = _syncing_client(stale_calls=0)
+    assert client.rates("EURUSD", "M5", 10).attrs["defasado"] is False
+    assert client.clock.sleeps == [] and fake.rates_calls == 1
+
+
 def test_rates_respect_terminal_maxbars():
     # O terminal recusa pedir maxbars candles ou mais ("Invalid params"); o cliente pede maxbars - 1.
     closes = [1.10 + i * 0.001 for i in range(20)]

@@ -162,6 +162,11 @@ def _candle_warnings(df: Any) -> list[str]:
             "O último candle abre depois do horário UTC atual: o servidor pode não usar UTC ou o relógio "
             "do Windows está errado. Não use os horários sem conferir."
         )
+    if df.attrs.get("defasado"):
+        warnings.append(
+            "Faltam os candles mais recentes: o terminal ainda está sincronizando o histórico deste ativo e o "
+            "último candle termina antes da última cotação. Repita o pedido em alguns segundos."
+        )
     return warnings
 
 

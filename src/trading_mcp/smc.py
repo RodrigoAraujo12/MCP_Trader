@@ -651,6 +651,11 @@ def _data_warnings(frames: Sequence[pd.DataFrame]) -> list[str]:
             "Candle com horário à frente do relógio UTC: o servidor pode não estar em UTC e os horários de dia, semana "
             "e sessões ficam errados. Não use sem conferir."
         )
+    if any(f.attrs.get("defasado") for f in frames):
+        notes.append(
+            "Faltam os candles mais recentes (o terminal ainda sincronizava o histórico): máximas, mínimas e estrutura "
+            "podem estar desatualizadas. Repita em alguns segundos."
+        )
     return notes
 
 

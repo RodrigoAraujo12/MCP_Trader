@@ -69,6 +69,16 @@ _TICK_ATTEMPTS = 3
 _TICK_RETRY_S = 0.3
 _RATES_ATTEMPTS = 3
 _RATES_RETRY_S = 0.5
+# O terminal entrega o histórico que tem guardado e só depois sincroniza: num ativo que ficou um tempo sem pedidos,
+# os candles param onde ele deixou de atualizar (conferido em 2026-10-04: XAUUSDm e EURUSDm vieram até 22:05 com
+# ticks às 23:17, e corretos segundos depois). Espera até _SYNC_ATTEMPTS × _SYNC_RETRY_S pelos candles novos.
+_SYNC_ATTEMPTS = 10
+_SYNC_RETRY_S = 0.5
+# Folga entre o fim do último candle e o tick lido antes do pedido (tick só de ask não abre candle).
+_SYNC_GRACE = timedelta(seconds=60)
+# Atraso maior não é tratado como sincronização pendente: o histórico nem chega perto do tick (como nos candles
+# sintéticos dos testes, de 2023, com ticks de agora).
+_SYNC_MAX_LAG = timedelta(days=90)
 # Cotação com até esta idade é "atual". Índices e forex têm ticks a cada poucos segundos na sessão.
 _FRESH_S = 60.0
 # Tick mais adiantado que isso em relação ao relógio UTC indica servidor fora de UTC (ou relógio errado).
@@ -497,6 +507,11 @@ class MT5Client:
     def _tick_valid(tick: Any) -> bool:
         return tick is not None and tick.time != 0 and tick.bid > 0 and tick.ask > 0
 
+    @staticmethod
+    def _tick_time(tick: Any) -> datetime:
+        time_msc = getattr(tick, "time_msc", 0) or 0
+        return tempo.from_epoch(time_msc / 1000 if time_msc else tick.time)
+
     def _traded_between(self, resolved: str, start: datetime, end: datetime) -> bool | None:
         """Houve candle M1 entre ``start`` e ``end``? None se o histórico não respondeu."""
         try:
@@ -577,8 +592,7 @@ class MT5Client:
             if self._is_forex(info):
                 pip = risk.pip_size(info.point, digits)
                 spread_pips = round(spread / pip, 1) if pip else None
-            time_msc = getattr(tick, "time_msc", 0) or 0
-            tick_time = tempo.from_epoch(time_msc / 1000 if time_msc else tick.time)
+            tick_time = self._tick_time(tick)
             now = self._now_utc()
             age = (now - tick_time).total_seconds()
             estado, aviso = self._freshness(resolved, tick_time, now)
@@ -615,10 +629,11 @@ class MT5Client:
         """Candles do mais antigo ao mais novo, com ``time`` em UTC.
 
         ``df.attrs``: ``ultimo_em_formacao`` (o último candle ainda está aberto, pelo horário e não
-        pela posição), ``horario_inconsistente`` (último candle abre depois de agora) e ``conectado``
-        (terminal conectado à corretora; sem conexão os candles recentes podem faltar). Sem o candle
-        atual, só sai o candle que de fato está aberto: na pausa diária ou no fim de semana o último
-        candle já fechou e é mantido.
+        pela posição), ``horario_inconsistente`` (último candle abre depois de agora), ``conectado``
+        (terminal conectado à corretora; sem conexão os candles recentes podem faltar) e ``defasado``
+        (o último candle termina antes da última cotação mesmo depois de esperar a sincronização do
+        terminal: os candles mais novos faltam). Sem o candle atual, só sai o candle que de fato está
+        aberto: na pausa diária ou no fim de semana o último candle já fechou e é mantido.
         """
         tf_key = (timeframe or "").strip().upper()
         if tf_key not in TIMEFRAMES:
@@ -630,15 +645,16 @@ class MT5Client:
             terminal_limit = self._terminal_maxbars - 1 if self._terminal_maxbars else count + 1
             request = min(count + (0 if include_current else 1), terminal_limit)
             tf = getattr(self._module(), TIMEFRAMES[tf_key])
-            data = None
-            for attempt in range(_RATES_ATTEMPTS):
-                if attempt:
-                    self._sleep(_RATES_RETRY_S)
-                data = self._call("copy_rates_from_pos", resolved, tf, 0, request)
-                if data is not None and len(data) > 0:
+            # Lido antes dos candles: todo tick lido aqui já tem de estar neles.
+            tick_time = self._last_tick_time(resolved)
+            data = self._copy_rates(resolved, tf, tf_key, request)
+            behind = self._behind_tick(data, tf_key, tick_time)
+            for _ in range(_SYNC_ATTEMPTS):
+                if not behind:
                     break
-            else:
-                raise MT5Error(f"Sem candles para {resolved} em {tf_key}: {self._last_error()}")
+                self._sleep(_SYNC_RETRY_S)
+                data = self._copy_rates(resolved, tf, tf_key, request)
+                behind = self._behind_tick(data, tf_key, tick_time)
             connected = self._connected
         df = pd.DataFrame(data)[_RATE_COLUMNS]
         df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
@@ -655,7 +671,34 @@ class MT5Client:
         df.attrs["ultimo_em_formacao"] = tempo.bar_in_progress(last_open, tf_key, now)
         df.attrs["horario_inconsistente"] = future
         df.attrs["conectado"] = connected
+        df.attrs["defasado"] = behind
         return df
+
+    def _copy_rates(self, resolved: str, tf: Any, tf_key: str, request: int) -> Any:
+        """Os ``request`` candles mais recentes; repete enquanto o terminal devolve vazio (histórico não carregado)."""
+        for attempt in range(_RATES_ATTEMPTS):
+            if attempt:
+                self._sleep(_RATES_RETRY_S)
+            data = self._call("copy_rates_from_pos", resolved, tf, 0, request)
+            if data is not None and len(data) > 0:
+                return data
+        raise MT5Error(f"Sem candles para {resolved} em {tf_key}: {self._last_error()}")
+
+    def _last_tick_time(self, resolved: str) -> datetime | None:
+        try:
+            tick = self._call("symbol_info_tick", resolved)
+        except MT5Error as exc:
+            log.warning("symbol_info_tick falhou para %s: %s", resolved, exc)
+            return None
+        return self._tick_time(tick) if self._tick_valid(tick) else None
+
+    @staticmethod
+    def _behind_tick(data: Any, tf_key: str, tick_time: datetime | None) -> bool:
+        """O último candle termina antes do tick (o terminal devolveu o histórico guardado, sem os candles novos)?"""
+        if tick_time is None:
+            return False
+        lag = tick_time - tempo.bar_end(tempo.from_epoch(int(data[-1]["time"])), tf_key)
+        return _SYNC_GRACE < lag <= _SYNC_MAX_LAG
 
     @staticmethod
     def _require_utc(start: datetime, end: datetime) -> tuple[datetime, datetime]:
