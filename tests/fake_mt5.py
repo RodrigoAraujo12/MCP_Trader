@@ -292,6 +292,7 @@ class FakeMT5:
         self.rates_calls = 0
         self.range_calls: list[tuple[Any, ...]] = []
         self.from_calls: list[tuple[Any, ...]] = []
+        self.pos_calls: list[tuple[Any, ...]] = []  # (símbolo, timeframe, posição inicial, quantidade)
         self.terminal_polls = 0
         self.shutdown_calls = 0
         self.initialized = False
@@ -392,6 +393,7 @@ class FakeMT5:
     # --- dados -----------------------------------------------------------
     def copy_rates_from_pos(self, symbol: str, timeframe: int, start_pos: int, count: int):
         self.rates_calls += 1
+        self.pos_calls.append((symbol, timeframe, start_pos, count))
         if self.rates_calls <= self.rates_fail_times:
             self._last_error = (-2, "Terminal: history not synchronized yet")
             return None
@@ -416,7 +418,9 @@ class FakeMT5:
         if date_from.tzinfo is None:
             raise AssertionError("copy_rates_from recebeu datetime sem fuso")
         data = self.rates_tf.get((symbol, timeframe), self.rates.get(symbol, np.array([], dtype=RATES_DTYPE)))
-        return data[data["time"] <= int(date_from.timestamp())][-count:].copy()
+        before = data[data["time"] <= int(date_from.timestamp())]
+        # Data anterior ao início do histórico: o terminal real devolve os primeiros candles que tem (posteriores).
+        return (before[-count:] if len(before) else data[:count]).copy()
 
     def copy_rates_range(self, symbol: str, timeframe: int, date_from: datetime, date_to: datetime):
         self.range_calls.append((symbol, timeframe, date_from, date_to))

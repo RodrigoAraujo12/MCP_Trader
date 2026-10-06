@@ -10,6 +10,7 @@ import pytest
 
 import fake_mt5 as fm
 from fake_mt5 import FakeMT5, Record, make_rates, make_symbol
+from trading_mcp import mt5_client
 from trading_mcp.config import Settings
 from trading_mcp.mt5_client import TIMEFRAMES, MT5Client, MT5Error, SymbolNotFoundError
 
@@ -379,6 +380,26 @@ def test_oldest_bar_is_the_first_of_what_the_terminal_keeps():
     client, _ = make_client(fake)
     # Com maxbars 10, o terminal entrega os 9 candles mais recentes: o mais antigo é o 12º (índice 11).
     assert client.oldest_bar("EURUSD", "H1") == datetime.fromtimestamp(1_700_000_000 + 11 * 3600, tz=timezone.utc)
+
+
+def test_oldest_bar_with_huge_window_asks_for_one_bar(monkeypatch):
+    # "Máx. barras" = Ilimitado: pedir a janela inteira derruba a conexão; só um candle por pedido.
+    monkeypatch.setattr(mt5_client, "_OLDEST_FULL_WINDOW", 5)
+    closes = [1.10 + i * 0.001 for i in range(20)]
+    full = FakeMT5([make_symbol("EURUSD")], rates={"EURUSD": make_rates(closes, start_time=1_700_000_000)}, maxbars=10)
+    client, _ = make_client(full)
+    # Histórico enche a janela (20 > 9): o mais antigo é o da última posição da janela, como antes.
+    assert client.oldest_bar("EURUSD", "H1") == datetime.fromtimestamp(1_700_000_000 + 11 * 3600, tz=timezone.utc)
+    # Nunca a janela inteira: um candle só, na última posição da janela (maxbars - 2).
+    assert [c[2:] for c in full.pos_calls if c[0] == "EURUSD"] == [(8, 1)]
+    assert full.from_calls == []
+    short = FakeMT5([make_symbol("EURUSD")], rates={"EURUSD": make_rates(closes[:5], start_time=1_700_000_000)},
+                    maxbars=10)
+    client, _ = make_client(short)
+    # Histórico menor que a janela: o primeiro candle que o terminal tem.
+    assert client.oldest_bar("EURUSD", "H1") == datetime.fromtimestamp(1_700_000_000, tz=timezone.utc)
+    assert [c[2:] for c in short.pos_calls if c[0] == "EURUSD"] == [(8, 1)]
+    assert [c[3] for c in short.from_calls] == [1]
 
 
 def test_oldest_bar_retries_and_raises_instead_of_returning_nothing():

@@ -69,6 +69,11 @@ _TICK_ATTEMPTS = 3
 _TICK_RETRY_S = 0.3
 _RATES_ATTEMPTS = 3
 _RATES_RETRY_S = 0.5
+# Com "Máx. barras no gráfico" grande (Ilimitado = 100 milhões), pedir a janela inteira para achar o candle mais
+# antigo derruba a conexão com o terminal ((-10004, 'No IPC connection'), conferido em 2026-10-06). Acima deste
+# tamanho de janela, oldest_bar pede um candle só.
+_OLDEST_FULL_WINDOW = 1_000_000
+_HISTORY_EPOCH = datetime(1971, 1, 1, tzinfo=timezone.utc)
 # O terminal entrega o histórico que tem guardado e só depois sincroniza: num ativo que ficou um tempo sem pedidos,
 # os candles param onde ele deixou de atualizar (conferido em 2026-10-04: XAUUSDm e EURUSDm vieram até 22:05 com
 # ticks às 23:17, e corretos segundos depois). Espera até _SYNC_ATTEMPTS × _SYNC_RETRY_S pelos candles novos.
@@ -787,18 +792,26 @@ class MT5Client:
         O terminal guarda um número fixo de candles ("Máx. de barras no gráfico"): no M1, um símbolo que
         negocia 24 h por dia (BTCUSD) tem menos dias de histórico que um índice com pausa diária. Falha de
         leitura vira MT5Error, nunca "sem histórico".
+
+        Janela grande (acima de _OLDEST_FULL_WINDOW): o candle da última posição da janela, se o histórico a enche;
+        senão o primeiro candle do histórico (``copy_rates_from`` com data anterior a ele devolve esse candle).
         """
         tf_key = (timeframe or "").strip().upper()
         if tf_key not in TIMEFRAMES:
             raise ValueError(f"Timeframe inválido: '{timeframe}'. Válidos: {', '.join(TIMEFRAMES)}.")
         with self._lock:
             resolved = self.resolve_symbol(symbol)
-            count = self._terminal_maxbars - 1 if self._terminal_maxbars else 99_999
+            window = self._terminal_maxbars - 1 if self._terminal_maxbars else 99_999
             tf = getattr(self._module(), TIMEFRAMES[tf_key])
             for attempt in range(_RATES_ATTEMPTS):
                 if attempt:
                     self._sleep(_RATES_RETRY_S)
-                data = self._call("copy_rates_from_pos", resolved, tf, 0, count)
+                if window <= _OLDEST_FULL_WINDOW:
+                    data = self._call("copy_rates_from_pos", resolved, tf, 0, window)
+                else:
+                    data = self._call("copy_rates_from_pos", resolved, tf, window - 1, 1)
+                    if data is None or len(data) == 0:
+                        data = self._call("copy_rates_from", resolved, tf, _HISTORY_EPOCH, 1)
                 if data is not None and len(data) > 0:
                     break
             else:
