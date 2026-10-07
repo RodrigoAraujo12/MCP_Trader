@@ -86,10 +86,13 @@ def us_market_holidays(year: int) -> set[date]:
     """Feriados da bolsa dos EUA (regras da NYSE) e os dias de fechamento mais cedo (3 de julho, dia seguinte ao Dia
     de Ação de Graças, véspera de Natal). Nesses dias os CFDs de índices e metais fecham antes do horário normal."""
     days = {
-        _observed(date(year, 1, 1)), _observed(date(year, 7, 4)), _observed(date(year, 12, 25)),
+        _observed(date(year, 7, 4)), _observed(date(year, 12, 25)),
         _nth_weekday(year, 1, 0, 3), _nth_weekday(year, 2, 0, 3), _nth_weekday(year, 5, 0, -1),
         _nth_weekday(year, 9, 0, 1), _easter(year) - timedelta(days=2),
     }
+    new_year = date(year, 1, 1)
+    if new_year.weekday() != 5:  # 1º de janeiro no sábado: a NYSE não fecha na sexta 31/12 (regra própria)
+        days.add(_observed(new_year))
     if year >= 2022:
         days.add(_observed(date(year, 6, 19)))
     thanksgiving = _nth_weekday(year, 11, 3, 4)
@@ -160,13 +163,13 @@ class Level:
 
 @dataclass(frozen=True)
 class Signal:
-    i: int  # candle do engolfo
-    time: datetime  # fechamento do engolfo (a ordem vale a partir daqui)
+    i: int  # candle que gerou o sinal
+    time: datetime  # fechamento desse candle (a ordem vale a partir daqui)
     direction: str  # "compra" ou "venda"
-    entry: float
+    entry: float  # preço da ordem limite; na ordem a mercado, a referência para o lote (fechamento do candle)
     stop: float
-    target: float
-    rr: float
+    target: float | None  # None = sem alvo (sai pelo stop, por sinal ou no horário)
+    rr: float | None
     spread: float
     valid_until: datetime
     levels: tuple[str, ...]
@@ -174,6 +177,7 @@ class Signal:
     target_name: str
     zone_pct: float | None
     poi: str | None = None
+    kind: str = "limite"  # "limite" ou "mercado" (executa na abertura do candle seguinte)
 
 
 @dataclass
@@ -181,18 +185,22 @@ class Step:
     signals: list[Signal] = field(default_factory=list)
     broken: list[str] = field(default_factory=list)
     refusals: list[dict[str, Any]] = field(default_factory=list)
+    exit_now: str | None = None  # motivo para zerar a posição aberta na abertura do candle seguinte
+    new_stop: float | None = None  # novo stop da posição aberta (vale a partir do candle seguinte)
 
 
-class SetupA:
-    """Máquina de estados do setup A sobre os candles do tempo de entrada (do mais antigo ao mais novo).
+class Clock:
+    """Relógio comum às estratégias: dia e semana de mercado (viram às 17:00 de Nova York), minutos desde a virada,
+    feriados e fechamentos mais cedo dos EUA, último dia útil do mês, notícias fortes e horário de zerar.
 
-    ``bars``: time (abertura, UTC), open, high, low, close, spread (pontos). ``context``: o mesmo no H1.
-    ``news``: horários (UTC) das notícias fortes, para o filtro de 30 min.
+    ``bars``: time (abertura, UTC), open, high, low, close, spread (pontos) e, se houver, tick_volume.
     """
 
-    def __init__(self, bars: pd.DataFrame, context: pd.DataFrame, point: float, digits: int, params: Params,
-                 tf_seconds: int, news: list[datetime] | None = None) -> None:
-        self.p = params
+    NAME = "estrategia"
+
+    def __init__(self, bars: pd.DataFrame, point: float, digits: int, tf_seconds: int,
+                 news: list[datetime] | None, news_min: int, flat_at: time, entry_start: time = time(2, 0),
+                 entry_end: time = time(16, 0)) -> None:
         self.point, self.digits = point, digits
         self.tf_min = tf_seconds // 60
         times = pd.DatetimeIndex(pd.to_datetime(bars["time"], utc=True)).as_unit("ns")
@@ -202,6 +210,7 @@ class SetupA:
         self.spread = bars["spread"].to_numpy(dtype=float) * point
         tol = bars["spread_bar"] if "spread_bar" in bars else bars["spread"]
         self.tolerance = tol.to_numpy(dtype=float) * point
+        self.volume = bars["tick_volume"].to_numpy(dtype=float) if "tick_volume" in bars else None
         # Relógio de parede de Nova York + 7 h: a virada das 17:00 cai à meia-noite (com o horário de verão).
         shifted = times.tz_convert(tempo.NOVA_YORK).tz_localize(None) + pd.Timedelta(hours=7)
         self.msd = (shifted.hour * 60 + shifted.minute).to_numpy()
@@ -212,23 +221,16 @@ class SetupA:
         iso = days.isocalendar()
         self.week = (iso["year"].to_numpy() * 100 + iso["week"].to_numpy()).astype(np.int64)
         self.bar_open_s = (times.asi8 // 10**9).astype(np.int64)
-        start, end = market_minute(params.entry_start), market_minute(params.entry_end)
-        self.start_msd, self.end_msd, self.flat_msd = start, end, market_minute(params.flat_at)
+        start, end = market_minute(entry_start), market_minute(entry_end)
+        self.start_msd, self.end_msd, self.flat_msd = start, end, market_minute(flat_at)
         self.in_window = (self.msd >= start) & (self.msd + self.tf_min <= end)
         last = {d: self._last_weekday(d) for d in np.unique(self.day)}
         self.month_end = np.array([last[d] for d in self.day], dtype=bool)
         holidays = {d for y in {self.day_date(d).year for d in last} for d in us_market_holidays(y)}
         self.holiday = np.array([self.day_date(d).date() in holidays for d in self.day], dtype=bool)
-        self._stats(bars)
-        self._context(context)
         self.news = np.array(sorted(int(n.timestamp()) for n in (news or [])), dtype=np.int64)
-        self.levels: dict[str, Level] = {}
-        self.active: list[Level] = []
-        self._cur_day: Any = None
-        self._cur_week: int | None = None
-        self._activated: set[str] = set()
+        self.news_min = news_min
 
-    # ------------------------------------------------------------------ preparo
     @staticmethod
     def day_date(day: int) -> datetime:
         return datetime(1970, 1, 1) + timedelta(days=int(day))
@@ -239,6 +241,60 @@ class SetupA:
         date = cls.day_date(day)
         nxt = date + timedelta(days=3 if date.weekday() == 4 else 1)
         return nxt.month != date.month
+
+    def bar_end(self, i: int) -> datetime:
+        return self.times[i].to_pydatetime() + timedelta(minutes=self.tf_min)
+
+    def day_time(self, i: int, msd: int) -> datetime:
+        """Instante (UTC) do minuto ``msd`` do dia de mercado do candle ``i``."""
+        return self.times[i].to_pydatetime() + timedelta(minutes=int(msd) - int(self.msd[i]))
+
+    def flat_time(self, i: int) -> datetime:
+        return self.day_time(i, self.flat_msd)
+
+    def in_news(self, moment: datetime) -> bool:
+        """``moment`` está a menos de ``news_min`` minutos de uma notícia forte? (``news_min`` 0 = sem filtro)"""
+        if not len(self.news) or self.news_min <= 0:
+            return False
+        t = int(moment.timestamp())
+        k = int(np.searchsorted(self.news, t - self.news_min * 60))
+        return k < len(self.news) and self.news[k] <= t + self.news_min * 60
+
+    def _round(self, price: float) -> float:
+        return round(round(price / self.point) * self.point, self.digits)
+
+    def register_fill(self, signal: Signal) -> None:
+        """Uma ordem do sinal foi executada (as estratégias que contam tentativas sobrescrevem)."""
+
+    def register_exit(self, signal: Signal) -> None:
+        """A posição do sinal foi encerrada (stop, alvo, horário ou saída pedida)."""
+
+    def step(self, i: int) -> Step:  # pragma: no cover - cada estratégia implementa
+        raise NotImplementedError
+
+
+class SetupA(Clock):
+    """Máquina de estados do setup A sobre os candles do tempo de entrada (do mais antigo ao mais novo).
+
+    ``context``: candles do H1. ``news``: horários (UTC) das notícias fortes, para o filtro de 30 min.
+    """
+
+    NAME = "setup A"
+
+    def __init__(self, bars: pd.DataFrame, context: pd.DataFrame, point: float, digits: int, params: Params,
+                 tf_seconds: int, news: list[datetime] | None = None) -> None:
+        super().__init__(bars, point, digits, tf_seconds, news, params.news_min, params.flat_at,
+                         params.entry_start, params.entry_end)
+        self.p = params
+        self._stats(bars)
+        self._context(context)
+        self.levels: dict[str, Level] = {}
+        self.active: list[Level] = []
+        self._cur_day: Any = None
+        self._cur_week: int | None = None
+        self._activated: set[str] = set()
+
+    # ------------------------------------------------------------------ preparo
 
     def _stats(self, bars: pd.DataFrame) -> None:
         """Máxima/mínima por dia, semana e janela de sessão (cada uma só é usada depois de acabar)."""
@@ -307,27 +363,6 @@ class SetupA:
         self.fvg_touch = touch
 
     # ------------------------------------------------------------------ ajudas
-    def bar_end(self, i: int) -> datetime:
-        return self.times[i].to_pydatetime() + timedelta(minutes=self.tf_min)
-
-    def day_time(self, i: int, msd: int) -> datetime:
-        """Instante (UTC) do minuto ``msd`` do dia de mercado do candle ``i``."""
-        return self.times[i].to_pydatetime() + timedelta(minutes=int(msd) - int(self.msd[i]))
-
-    def flat_time(self, i: int) -> datetime:
-        return self.day_time(i, self.flat_msd)
-
-    def in_news(self, moment: datetime) -> bool:
-        """``moment`` está a menos de ``news_min`` minutos de uma notícia forte?"""
-        if not len(self.news):
-            return False
-        t = int(moment.timestamp())
-        k = int(np.searchsorted(self.news, t - self.p.news_min * 60))
-        return k < len(self.news) and self.news[k] <= t + self.p.news_min * 60
-
-    def _round(self, price: float) -> float:
-        return round(round(price / self.point) * self.point, self.digits)
-
     def zone(self, i: int, price: float) -> float | None:
         """Posição de ``price`` (0-100%) na última perna do H1 fechado até o fim do candle ``i``, esticada pelos
         extremos posteriores (inclusive os do H1 ainda aberto, vistos nos candles de entrada já fechados)."""
@@ -393,6 +428,12 @@ class SetupA:
         """Processa o candle ``i`` (já fechado)."""
         self._roll(i)
         out = Step()
+        self._update_levels(i, out)
+        self._reversals(i, out)
+        return out
+
+    def _update_levels(self, i: int, out: Step) -> None:
+        """Varredura (pavio além e fechamento de volta) arma o nível; fechamento além o mata (vai para ``broken``)."""
         h, l, c, window = self.high[i], self.low[i], self.close[i], bool(self.in_window[i])
         for lv in self.active:
             if lv.state == "rompido":
@@ -418,6 +459,8 @@ class SetupA:
             if lv.armed and i - lv.last_sweep > self.p.engulf_max_bars:
                 lv.armed = False
 
+    def _reversals(self, i: int, out: Step) -> None:
+        """Engolfo depois de varredura armada: sinal do setup A (ou recusa com o motivo)."""
         for direction, side in (("venda", "alta"), ("compra", "baixa")):
             armed = [lv for lv in self.active if lv.armed and lv.side == side]
             if not armed or not self._engulf(i, direction):
@@ -432,7 +475,6 @@ class SetupA:
             else:
                 out.refusals.append({"i": i, "time": self.bar_end(i), "direction": direction, "reason": result,
                                      "levels": [lv.name for lv in armed]})
-        return out
 
     def _engulf(self, i: int, direction: str) -> bool:
         if i == 0:

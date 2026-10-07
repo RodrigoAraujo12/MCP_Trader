@@ -41,13 +41,13 @@ import pandas as pd
 from trading_mcp import tempo
 from trading_mcp.calendario import CalendarError, EconomicCalendar
 from trading_mcp.limites import MIN_ROOM, RiskRules
-from trading_mcp.setup_a import Params, SetupA, Signal, epoch_s
+from trading_mcp.setup_a import Clock, Params, SetupA, Signal, epoch_s
 
 UTC = timezone.utc
 CACHE_DIR = Path.home() / "trading-mcp" / "backtest"
 # Cópia de uma exportação longa do serviço do calendário (InpDaysBack alto), para o filtro de notícia no passado.
 HISTORY_CALENDAR = CACHE_DIR / "calendar_US_hist.json"
-_COLUMNS = ("open", "high", "low", "close", "spread")
+_COLUMNS = ("open", "high", "low", "close", "spread", "tick_volume")
 _TF_SECONDS = {"M1": 60, "M5": 300, "M15": 900, "H1": 3600}
 _CHUNK_DAYS = {"M1": 7, "M5": 30, "M15": 90, "H1": 365}
 DEFAULT_SPLIT = datetime(2025, 1, 1, tzinfo=UTC)
@@ -99,7 +99,9 @@ def _load(path: Path) -> tuple[pd.DataFrame, dict[str, Any]] | None:
     if not path.is_file() or not meta_path.is_file():
         return None
     with np.load(path) as z:
-        df = pd.DataFrame({c: z[c] for c in _COLUMNS})
+        # Cache de uma versão sem tick_volume: aproveita com volume 0 (baixar de novo pode perder histórico que o
+        # terminal não guarda mais); o VWAP vira média simples nesses candles.
+        df = pd.DataFrame({c: z[c] if c in z.files else np.zeros(len(z["time"])) for c in _COLUMNS})
         df.insert(0, "time", pd.to_datetime(z["time"], unit="s", utc=True))
     return df, json.loads(meta_path.read_text(encoding="utf-8"))
 
@@ -114,6 +116,8 @@ def fetch(client: Any, symbol: str, tf: str, start: datetime, end: datetime,
         b = min(a + step, end)
         df = client.rates_between(symbol, tf, a, b)
         if len(df):
+            if "tick_volume" not in df:
+                df = df.assign(tick_volume=0.0)
             parts.append(df[["time", *_COLUMNS]])
         elif (b - a) >= timedelta(days=3):
             say(f"Aviso: {symbol} {tf} sem candles de {a:%Y-%m-%d} a {b:%Y-%m-%d} (histórico ainda não carregado?).")
@@ -207,6 +211,8 @@ class _Position:
     moved: bool = False
     last: tuple[float, float] | None = None  # (fechamento bid, spread) do último candle percorrido
     last_t: int | None = None  # fim desse candle (s)
+    exit_pending: str | None = None  # a estratégia mandou zerar: sai na abertura do candle seguinte
+    exit_after: int = 0  # (s) a saída pedida só executa a partir daqui (atraso de execução)
 
 
 @dataclass
@@ -222,16 +228,21 @@ class Result:
 
 
 class Simulator:
-    def __init__(self, data: Data, params: Params, *, balance: float = 10_000.0, rules: RiskRules = RiskRules(),
+    def __init__(self, data: Data, params: Any, *, balance: float = 10_000.0, rules: RiskRules = RiskRules(),
                  spread_mult: float = 1.0, news: list[datetime] | None = None, start: datetime | None = None,
-                 end: datetime | None = None) -> None:
+                 end: datetime | None = None, strategy: type[Clock] = SetupA, delay_s: int = 0) -> None:
         self.data, self.p, self.rules = data, params, rules
         self.spec = data.spec
         self.tf_s = _TF_SECONDS[data.entry_tf]
+        if not 0 <= delay_s < self.tf_s:
+            raise ValueError("O atraso de execução precisa ficar entre 0 e a duração do candle de entrada.")
+        # Atraso entre o fechamento do candle do sinal e a execução das ordens a mercado e das saídas pedidas pela
+        # estratégia (o robô ao vivo lê o candle fechado e só então envia a ordem).
+        self.delay_s = int(delay_s)
         bars = data.bars.copy()
         bars["spread_bar"] = bars["spread"]  # tolerância do engolfo: o estresse muda o custo, não os sinais
         bars["spread"] = bars["spread"] * spread_mult
-        self.strat = SetupA(bars, data.context, self.spec.point, self.spec.digits, params, self.tf_s, news)
+        self.strat = strategy(bars, data.context, self.spec.point, self.spec.digits, params, self.tf_s, news)
         self.open, self.high, self.low, self.close = (bars[c].to_numpy(dtype=float) for c in ("open", "high", "low",
                                                                                               "close"))
         self.spread = self.strat.spread
@@ -328,9 +339,12 @@ class Simulator:
             "resolucao": "+".join(sorted(pos.resolution)),
         })
         self.pos = None
+        self.strat.register_exit(sig)
 
     def _sub(self, i: int, sb: tuple[int, int, float, float, float, float, float, str]) -> None:
         t, dur, o, h, l, c, s, res = sb
+        if self.pos is not None and self.pos.exit_pending and self._due(t, dur, self.pos.exit_after):
+            self._close(t, o + s if self.pos.signal.direction == "venda" else o, self.pos.exit_pending)
         if self.order is not None:
             sig = self.order.signal
             sell = sig.direction == "venda"
@@ -338,19 +352,26 @@ class Simulator:
                 return self._cancel("prazo")
             if self.strat.in_news(datetime.fromtimestamp(t, UTC)):
                 return self._cancel("noticia")
-            fill = h >= sig.entry if sell else l + s <= sig.entry
-            seen = l + s <= sig.target if sell else h >= sig.target
-            stop = h + s >= sig.stop if sell else l <= sig.stop
-            if fill and stop:
-                # Abertura além da entrada e do stop (salto): executa na abertura e o stop dispara na hora.
-                self._open(i, t, max(sig.entry, o) if sell else min(sig.entry, o + s), res)
-                return self._close(t, max(sig.stop, o + s) if sell else min(sig.stop, o), "stop")
-            if seen:
-                return self._cancel("alvo_antes_da_execucao")
-            if fill:
-                self._open(i, t, max(sig.entry, o) if sell else min(sig.entry, o + s), res)
-                self.pos.last, self.pos.last_t = (c, s), t + dur  # type: ignore[union-attr]
-            return None
+            if sig.kind == "mercado":
+                if not self._due(t, dur, int(sig.time.timestamp()) + self.delay_s):
+                    return None  # ainda dentro do atraso de execução
+                # Executa na abertura do primeiro candle depois do sinal (e do atraso); o resto do candle já conta para
+                # o stop.
+                self._open(i, t, o if sell else o + s, res)
+            else:
+                fill = h >= sig.entry if sell else l + s <= sig.entry
+                seen = sig.target is not None and (l + s <= sig.target if sell else h >= sig.target)
+                stop = h + s >= sig.stop if sell else l <= sig.stop
+                if fill and stop:
+                    # Abertura além da entrada e do stop (salto): executa na abertura e o stop dispara na hora.
+                    self._open(i, t, max(sig.entry, o) if sell else min(sig.entry, o + s), res)
+                    return self._close(t, max(sig.stop, o + s) if sell else min(sig.stop, o), "stop")
+                if seen:
+                    return self._cancel("alvo_antes_da_execucao")
+                if fill:
+                    self._open(i, t, max(sig.entry, o) if sell else min(sig.entry, o + s), res)
+                    self.pos.last, self.pos.last_t = (c, s), t + dur  # type: ignore[union-attr]
+                return None
         pos = self.pos
         if pos is None:
             return None
@@ -367,9 +388,9 @@ class Simulator:
         if (h + s >= pos.stop) if sell else (l <= pos.stop):
             price = max(pos.stop, o + s) if sell else min(pos.stop, o)
             return self._close(t, price, "zero" if pos.moved else "stop")
-        if (l + s <= sig.target) if sell else (h >= sig.target):
+        if sig.target is not None and ((l + s <= sig.target) if sell else (h >= sig.target)):
             return self._close(t, min(sig.target, o + s) if sell else max(sig.target, o), "alvo")
-        be = self.p.breakeven_r
+        be = getattr(self.p, "breakeven_r", None)
         if be is not None and not pos.moved:
             dist = abs(sig.entry - sig.stop)
             if (l + s <= pos.fill - be * dist) if sell else (h >= pos.fill + be * dist):
@@ -379,10 +400,22 @@ class Simulator:
         pos.last, pos.last_t = (c, s), t + dur
         return None
 
-    def _size(self, sig: Signal) -> tuple[float, float] | str:
+    @staticmethod
+    def _due(t: int, dur: int, at: int) -> bool:
+        """A execução marcada para `at` acontece neste candle? Sem M1 (candle inteiro), o atraso cai dentro dele e
+        a execução fica na abertura: não dá para simular o atraso sem os candles de 1 minuto."""
+        return t >= at or (dur > 60 and t + dur > at)
+
+    def _size(self, sig: Signal, i: int | None = None) -> tuple[float, float] | str:
         r = self.rules
-        day_room = r.daily_pct / 100 * self.day_base + self.day_result
-        week_room = r.weekly_pct / 100 * self.week_base + self.week_result
+        pending = 0.0
+        if i is not None and self.pos is not None and self.pos.exit_pending:
+            # Virada de mão: a posição que vai sair ainda não entrou no resultado; conta pelo fechamento atual.
+            pos, sell = self.pos, self.pos.signal.direction == "venda"
+            mark = self.close[i] + (self.spread[i] if sell else 0.0)
+            pending = ((pos.fill - mark) if sell else (mark - pos.fill)) * pos.lots * self.spec.money_per_unit
+        day_room = r.daily_pct / 100 * self.day_base + self.day_result + pending
+        week_room = r.weekly_pct / 100 * self.week_base + self.week_result + pending
         if day_room <= MIN_ROOM:
             return "limite_dia"
         if week_room <= MIN_ROOM:
@@ -419,16 +452,21 @@ class Simulator:
             if self.pos is not None and end_s >= self.pos.flat_s:
                 sell = self.pos.signal.direction == "venda"
                 self._close(end_s, self.close[i] + (self.spread[i] if sell else 0.0), "horario")
+            if self.pos is not None and step.new_stop is not None:
+                self.pos.stop = step.new_stop
+            if self.pos is not None and step.exit_now:
+                self.pos.exit_pending, self.pos.exit_after = step.exit_now, end_s + self.delay_s
             if not self.start_s <= int(self.bo[i]) < self.end_s:
                 continue
             for r in step.refusals:
                 self.refusals[r["reason"]] += 1
             for sig in step.signals:
                 self.signals += 1
-                if self.order is not None or self.pos is not None:
+                # Com a saída já pedida, a ordem nova executa logo depois dela (virada de mão).
+                if self.order is not None or (self.pos is not None and not self.pos.exit_pending):
                     self.refusals["ocupado"] += 1
                     continue
-                sized = self._size(sig)
+                sized = self._size(sig, i)
                 if isinstance(sized, str):
                     self.refusals[sized] += 1
                     continue
@@ -502,7 +540,8 @@ def verdict(s: dict[str, Any]) -> dict[str, Any]:
 
 
 def report(result: Result, *, params: Params, spec: Spec, entry_tf: str, start: datetime, end: datetime,
-           split: datetime, spread_mult: float, news_info: dict[str, Any], data_info: dict[str, Any]) -> dict[str, Any]:
+           split: datetime, spread_mult: float, news_info: dict[str, Any], data_info: dict[str, Any],
+           strategy_name: str = "setup A", delay_s: int = 0) -> dict[str, Any]:
     trades = result.trades
     split_iso = tempo.iso_utc(split)
     fit = [t for t in trades if t["sinal_utc"] < split_iso]
@@ -511,12 +550,14 @@ def report(result: Result, *, params: Params, spec: Spec, entry_tf: str, start: 
     params_out = {k: (str(v) if not isinstance(v, (int, float, str, bool, type(None), tuple)) else v)
                   for k, v in asdict(params).items()}
     return {
+        "estrategia": strategy_name,
         "simbolo": spec.symbol,
         "tempo_entrada": entry_tf,
         "periodo": {"de": tempo.iso_utc(start), "ate": tempo.iso_utc(end), "divisao": split_iso},
         "saldo_inicial": result.start_balance,
         "saldo_final": round(result.final_balance, 2),
         "spread_mult": spread_mult,
+        "atraso_execucao_s": delay_s,
         "regras": params_out,
         "sinais": result.signals,
         "recusas": dict(result.refusals.most_common()),
@@ -545,11 +586,11 @@ def markdown(rep: dict[str, Any]) -> str:
 
     v = rep["criterio_conferencia"]
     out = [
-        f"# Backtest setup A — {rep['simbolo']} {rep['tempo_entrada']}",
+        f"# Backtest {rep.get('estrategia', 'setup A')} — {rep['simbolo']} {rep['tempo_entrada']}",
         "",
         f"Período {rep['periodo']['de'][:10]} a {rep['periodo']['ate'][:10]}; ajuste antes de "
         f"{rep['periodo']['divisao'][:10]}, conferência depois. Saldo inicial {rep['saldo_inicial']:.0f}, spread x"
-        f"{rep['spread_mult']:g}.",
+        f"{rep['spread_mult']:g}, atraso de execução {rep.get('atraso_execucao_s', 0)} s.",
         "",
         "| Período | Operações | Acerto | R médio | Fator de lucro | Resultado | Drawdown máx. | Pior semana |",
         "|---|---|---|---|---|---|---|---|",
@@ -564,7 +605,7 @@ def markdown(rep: dict[str, Any]) -> str:
                                      for k, s in rep["por_direcao"].items()),
         "Por sessão: " + "; ".join(f"{k} {s['operacoes']} ops, R médio {s['r_medio']}"
                                     for k, s in rep["por_sessao"].items()),
-        "Por nível varrido: " + "; ".join(f"{k} {s['operacoes']} ops, R médio {s['r_medio']}"
+        "Por nível/origem: " + "; ".join(f"{k} {s['operacoes']} ops, R médio {s['r_medio']}"
                                           for k, s in rep["por_nivel"].items()),
         "Por ano: " + "; ".join(f"{k} {s['operacoes']} ops, R médio {s['r_medio']}"
                                  for k, s in rep["por_ano"].items()),
@@ -589,11 +630,15 @@ def _date(text: str) -> datetime:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m trading_mcp.backtest", description=__doc__.splitlines()[0])
+    parser.add_argument("--estrategia", choices=("setup_a", "rompimento", "faixa_ruido", "orb"), default="setup_a",
+                        help="setup_a (reversão, padrão), rompimento (níveis a favor), faixa_ruido e orb (Nasdaq, M5)")
     parser.add_argument("--simbolo", default="XAUUSDm")
     parser.add_argument("--de", type=_date, help="início dos sinais (padrão: 3 semanas depois do 1º candle)")
     parser.add_argument("--ate", type=_date, help="fim (padrão: agora)")
     parser.add_argument("--saldo", type=float, default=10_000.0)
     parser.add_argument("--spread-mult", type=float, default=1.0)
+    parser.add_argument("--atraso-seg", type=int, default=0,
+                        help="segundos entre o fechamento do candle e a execução das ordens a mercado e saídas pedidas")
     parser.add_argument("--tempo", choices=("M15", "M5"), default="M15")
     parser.add_argument("--engolfo", choices=("corpo", "extremo"), default="corpo")
     parser.add_argument("--sem-premium", action="store_true", help="sem o filtro de prêmio/desconto do H1")
@@ -602,6 +647,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="POI do tempo maior onde a varredura tem de acontecer (fvg_h1: FVG do H1 ainda não tocado)")
     parser.add_argument("--opera-fim-do-mes", action="store_true",
                         help="opera no último dia útil do mês (a metodologia só evita esse dia em forex e ouro)")
+    parser.add_argument("--noticia-min", type=int,
+                        help="minutos sem entrada antes/depois de notícia forte (padrão: 30 no setup A e no rompimento, 0 nos artigos)")
     parser.add_argument("--divisao", type=_date, default=DEFAULT_SPLIT)
     parser.add_argument("--calendario", type=Path,
                         help="arquivo calendar_US.json (padrão: a cópia longa em ~/trading-mcp/backtest, senão o do terminal)")
@@ -627,13 +674,21 @@ def main(argv: list[str] | None = None) -> int:
         cal_path = HISTORY_CALENDAR if HISTORY_CALENDAR.is_file() else (
             Path(client.terminal_data_path()) / "MQL5" / "Files" / "trading_mcp" / "calendar_US.json")
     news, news_info = load_news(cal_path, start - timedelta(days=1), end)
-    params = Params(engulf=args.engolfo, premium_discount=not args.sem_premium, breakeven_r=args.zero_em,
-                    skip_month_end=not args.opera_fim_do_mes, poi=args.poi)
+    from trading_mcp.estrategias import STRATEGIES
+
+    strategy, params_cls = STRATEGIES[args.estrategia]
+    extra = {} if args.noticia_min is None else {"news_min": args.noticia_min}
+    if params_cls is Params:
+        params = Params(engulf=args.engolfo, premium_discount=not args.sem_premium, breakeven_r=args.zero_em,
+                        skip_month_end=not args.opera_fim_do_mes, poi=args.poi, **extra)
+    else:
+        params = params_cls(**extra)
     result = Simulator(data, params, balance=args.saldo, spread_mult=args.spread_mult, news=news,
-                       start=start, end=end).run()
+                       start=start, end=end, strategy=strategy, delay_s=args.atraso_seg).run()
     data_info = {"m1_desde": tempo.iso_utc(data.m1["time"].iloc[0].to_pydatetime()) if data.m1 is not None else None}
     rep = report(result, params=params, spec=data.spec, entry_tf=args.tempo, start=start, end=end,
-                 split=args.divisao, spread_mult=args.spread_mult, news_info=news_info, data_info=data_info)
+                 split=args.divisao, spread_mult=args.spread_mult, news_info=news_info, data_info=data_info,
+                 strategy_name=strategy.NAME, delay_s=args.atraso_seg)
     folder = args.saida or CACHE_DIR / "execucoes" / datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     folder.mkdir(parents=True, exist_ok=True)
     (folder / "relatorio.json").write_text(json.dumps(rep, indent=1, ensure_ascii=False, default=str),
