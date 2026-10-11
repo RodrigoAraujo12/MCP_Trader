@@ -39,6 +39,8 @@
 }
 
 *, *::before, *::after { box-sizing: border-box; }
+/* Classes com display (grid, flex) venceriam o atributo hidden. */
+[hidden] { display: none !important; }
 
 html, body { margin: 0; }
 @media (pointer: fine) { html { overscroll-behavior: none; } }
@@ -121,6 +123,95 @@ button { cursor: pointer; -webkit-tap-highlight-color: transparent; }
 .estado[data-estado="atual"] .ponto { background: var(--bull); }
 .estado[data-estado="atrasado"] .ponto, .estado[data-estado="erro"] .ponto { background: var(--warn); }
 #contagem, #spread { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+/* ------------------------------------------------------------------ abas das telas */
+.vistas { display: flex; gap: 4px; }
+.vistas a {
+  display: inline-flex; align-items: center; height: 32px; padding: 0 10px; border-radius: var(--radius);
+  color: var(--text-muted); text-decoration: none; font-weight: 500;
+  transition: color 150ms var(--ease), background-color 150ms var(--ease);
+}
+.vistas a:hover { color: var(--text); background: var(--surface-2); }
+.vistas a[aria-current="page"] { color: var(--text); box-shadow: inset 0 -2px 0 var(--accent); border-radius: var(--radius) var(--radius) 0 0; }
+
+/* Na tela do journal, símbolo, timeframe e cotação (que são do gráfico) saem do topo. */
+body[data-vista="journal"] .simbolo,
+body[data-vista="journal"] #timeframes,
+body[data-vista="journal"] .cotacao { display: none; }
+
+/* ------------------------------------------------------------------ journal */
+.journal { min-width: 0; overflow-y: auto; overscroll-behavior: contain; }
+.journal[hidden] { display: none; }
+.journal-barra {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px;
+  padding: 10px 16px; border-bottom: 1px solid var(--border);
+}
+.journal-barra h1 { margin: 0 8px 0 0; font-size: 15px; font-weight: 600; }
+.filtro { display: inline-flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--text-muted); }
+.filtro select {
+  height: 30px; padding: 0 8px; min-width: 120px;
+  background-color: var(--surface-2); color: var(--text); border: 1px solid var(--border-strong); border-radius: var(--radius);
+}
+.sinc { margin: 0 0 0 auto; font-size: 12.5px; color: var(--text-muted); text-wrap: pretty; }
+.sinc.velha { color: var(--warn); }
+.journal-corpo { padding: 16px; max-width: 1400px; }
+.aviso-amostra {
+  display: inline-flex; align-items: center; gap: 8px; margin: 0 0 14px; padding: 6px 10px;
+  border: 1px solid rgba(224, 165, 38, 0.4); border-radius: var(--radius); background: rgba(224, 165, 38, 0.08);
+  font-size: 13px; color: var(--text);
+}
+.aviso-amostra::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--warn); flex: none; }
+.kpis.grandes { padding: 0 0 16px; gap: 12px 40px; }
+.kpis.grandes dd { font-size: 22px; font-weight: 600; letter-spacing: -0.01em; }
+.kpis.grandes dd small { font-size: 12.5px; }
+
+.bloco { padding: 16px 0; border-top: 1px solid var(--border); min-width: 0; }
+.bloco h2 { margin: 0 0 8px; font-size: 13px; font-weight: 600; }
+.bloco-cab { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 4px; }
+.bloco-cab h2 { margin: 0; }
+.curva-moldura { position: relative; height: 340px; margin-top: 8px; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+.curva { position: absolute; inset: 0; }
+
+.grupos-grade { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 40px; }
+.dimensao + .dimensao { margin-top: 14px; }
+.dimensao h3 { margin: 0 0 4px; font-size: 12px; font-weight: 500; color: var(--text-muted); }
+.grupo {
+  display: grid; grid-template-columns: minmax(96px, 1.3fr) 28px 52px minmax(90px, 1.6fr) 56px 92px;
+  align-items: center; gap: 0 10px; padding: 4px 0; font-size: 13px;
+}
+.grupo > span { white-space: nowrap; }
+.grupo .nome { white-space: normal; }
+.grupo + .grupo { border-top: 1px solid var(--border); }
+.grupo .nome { color: var(--text-2); overflow-wrap: anywhere; }
+.grupo .n, .grupo .acerto, .grupo .rm, .grupo .res { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; }
+.grupo .n { color: var(--text-muted); }
+.grupo .rm.sem { color: var(--text-muted); }
+.barra-r { position: relative; height: 10px; }
+.barra-r::before { content: ""; position: absolute; left: 50%; top: -3px; bottom: -3px; width: 1px; background: var(--border-strong); }
+.barra-r span { position: absolute; top: 0; bottom: 0; border-radius: 2px; }
+.barra-r .pos { left: 50%; background: var(--bull); }
+.barra-r .neg { right: 50%; background: var(--bear); }
+.cab-grupo { font-size: 11.5px; color: var(--text-muted); padding-bottom: 2px; }
+.cab-grupo span { text-align: right; }
+
+.mais summary {
+  padding: 6px 0; font-size: 12.5px; color: var(--text-2); cursor: pointer; list-style-position: inside;
+  border-top: 1px solid var(--border);
+}
+.mais summary:hover { color: var(--text); }
+.mais[open] summary { color: var(--text-muted); }
+
+.tabela-rolagem { overflow-x: auto; }
+/* .tabela.operacoes: precisa vencer as regras da tabela da estrutura (.tabela td), que vêm depois. */
+.tabela.operacoes { min-width: 820px; font-size: 13px; }
+.tabela.operacoes th, .tabela.operacoes td { padding: 7px 14px 7px 0; vertical-align: top; }
+.tabela.operacoes th { position: sticky; top: 0; background: var(--bg); white-space: nowrap; }
+.tabela.operacoes td { border-top: 1px solid var(--border); }
+.tabela.operacoes td.num, .tabela.operacoes th.num { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.tabela.operacoes td:first-child { width: auto; padding-left: 0; font-family: var(--font); color: var(--text-2); white-space: nowrap; box-shadow: none; }
+.tabela.operacoes td:nth-child(7) { max-width: 260px; }
+.tabela.operacoes td:last-child { min-width: 200px; padding-right: 0; }
+.tabela.operacoes .ctx { font-size: 12px; color: var(--text-muted); }
 
 /* ------------------------------------------------------------------ conta e limites */
 .conta { border-bottom: 1px solid var(--border); background: var(--bg); }
@@ -297,7 +388,7 @@ button { cursor: pointer; -webkit-tap-highlight-color: transparent; }
 /* ------------------------------------------------------------------ telas maiores: tudo cabe na janela */
 @media (min-width: 1101px) {
   body { height: 100dvh; overflow: hidden; }
-  .area, .grafico-bloco, .lateral { min-height: 0; }
+  .area, .grafico-bloco, .lateral, .journal { min-height: 0; }
   .grafico-moldura { min-height: 0; }
 }
 
@@ -309,6 +400,8 @@ button { cursor: pointer; -webkit-tap-highlight-color: transparent; }
   .lateral { overflow: visible; display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
   .secao + .secao { border-top: 0; }
   .secao { border-bottom: 1px solid var(--border); }
+  .grupos-grade { grid-template-columns: minmax(0, 1fr); }
+  .sinc { margin-left: 0; flex-basis: 100%; }
 }
 @media (max-width: 640px) {
   .topo { gap: 10px; padding: 10px 12px; }
@@ -323,6 +416,12 @@ button { cursor: pointer; -webkit-tap-highlight-color: transparent; }
   .legenda { font-size: 11px; max-width: calc(100% - 84px); }
   .kpis { gap: 10px 20px; padding: 10px 12px; }
   .medidor-kpi { flex-basis: 100%; max-width: none; }
+  .journal-corpo { padding: 12px; }
+  .kpis.grandes { padding: 0 0 12px; }
+  .kpis.grandes dd { font-size: 18px; }
+  .grupo { grid-template-columns: minmax(80px, 1fr) 24px 40px minmax(48px, 1fr) 46px; gap: 0 8px; }
+  .grupo .res, .cab-grupo span:last-child { display: none; }
+  .curva-moldura { height: 260px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

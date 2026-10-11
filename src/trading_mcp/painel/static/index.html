@@ -15,6 +15,11 @@
   <header class="topo">
     <div class="marca" translate="no">MCP Trader</div>
 
+    <nav class="vistas" aria-label="Telas">
+      <a href="?vista=mercado" data-vista="mercado" aria-current="page">Mercado</a>
+      <a href="?vista=journal" data-vista="journal">Journal</a>
+    </nav>
+
     <form class="simbolo" id="form-simbolo" autocomplete="off">
       <label for="campo-simbolo" class="sr">Símbolo</label>
       <input id="campo-simbolo" name="simbolo" list="lista-simbolos" spellcheck="false" autocapitalize="characters"
@@ -108,6 +113,56 @@
         <ul class="avisos" id="avisos"></ul>
       </section>
     </aside>
+  </main>
+
+  <main class="journal" id="vista-journal" hidden aria-labelledby="titulo-journal">
+    <div class="journal-barra">
+      <h1 id="titulo-journal">Journal</h1>
+      <div class="segmentos pequeno" id="periodos" role="group" aria-label="Período"></div>
+      <label class="filtro"><span>Símbolo</span><select id="filtro-simbolo"><option value="">Todos</option></select></label>
+      <label class="filtro"><span>Setup</span><select id="filtro-setup"><option value="">Todos</option></select></label>
+      <p class="sinc" id="sinc"></p>
+    </div>
+
+    <div class="journal-corpo" id="journal-corpo">
+      <p class="sutil" id="journal-estado">Carregando…</p>
+
+      <div id="journal-conteudo" hidden>
+        <p class="aviso-amostra" id="aviso-amostra" hidden></p>
+        <dl class="kpis grandes" id="journal-kpis"></dl>
+
+        <section class="bloco" aria-labelledby="titulo-curva">
+          <div class="bloco-cab">
+            <h2 id="titulo-curva">Resultado acumulado</h2>
+            <div class="segmentos pequeno" id="unidade" role="group" aria-label="Unidade da curva">
+              <button type="button" data-unidade="r" aria-pressed="true">R</button>
+              <button type="button" data-unidade="dinheiro" aria-pressed="false">Dinheiro</button>
+            </div>
+          </div>
+          <p class="nota" id="nota-curva"></p>
+          <div class="curva-moldura"><div id="curva" class="curva" role="img" aria-label="Curva do resultado acumulado"></div>
+            <div class="legenda" id="legenda-curva" translate="no"></div></div>
+        </section>
+
+        <div class="grupos-grade">
+          <section class="bloco" aria-labelledby="titulo-contexto">
+            <h2 id="titulo-contexto">Por contexto SMC na entrada</h2>
+            <p class="nota">Cada linha é uma leitura isolada, medida com os candles fechados antes da entrada. A barra é o R médio do grupo.</p>
+            <div id="por-contexto"></div>
+          </section>
+          <section class="bloco" aria-labelledby="titulo-outros">
+            <h2 id="titulo-outros">Por setup, símbolo e mais</h2>
+            <p class="nota">Uma operação com várias tags conta em cada uma.</p>
+            <div id="por-outros"></div>
+          </section>
+        </div>
+
+        <section class="bloco" aria-labelledby="titulo-operacoes">
+          <h2 id="titulo-operacoes">Operações fechadas</h2>
+          <div class="tabela-rolagem"><table class="tabela operacoes" id="tabela-operacoes"></table></div>
+        </section>
+      </div>
+    </div>
   </main>
 
   <footer class="rodape">

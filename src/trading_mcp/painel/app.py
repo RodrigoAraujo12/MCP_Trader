@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import math
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -21,8 +22,9 @@ from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
-from trading_mcp import limites, smc, tempo
+from trading_mcp import journal as journal_module, limites, smc, tempo
 from trading_mcp.config import Settings
+from trading_mcp.journal import Journal, JournalError
 from trading_mcp.mt5_client import MT5Client, MT5Error, SymbolNotFoundError
 from trading_mcp.painel import graficos
 
@@ -63,8 +65,29 @@ def _timeframe(request: Request, default: str = "M5") -> str:
     return request.query_params.get("tf", default).strip().upper() or default
 
 
-def create_app(settings: Settings, mt5: MT5Client) -> Starlette:
+def _days(request: Request) -> float | None:
+    raw = request.query_params.get("dias", "").strip()
+    if not raw:
+        return None
+    try:
+        days = float(raw)
+    except ValueError:
+        raise ValueError("`dias` precisa ser um número (ex.: 30).") from None
+    if not 0 < days <= 3660:
+        raise ValueError("`dias` vai de 1 a 3660; vazio = todo o journal.")
+    return days
+
+
+# Campos de cada operação que a tela do journal usa (o journal_listar do chat traz mais).
+_OPERATION_FIELDS = ("id", "ticket", "simbolo", "direcao", "abertura", "fechamento", "duracao", "volume",
+                     "preco_entrada", "preco_saida", "resultado_liquido", "r", "setup", "tags", "noticia",
+                     "fechamento_motivo", "contexto")
+
+
+def create_app(settings: Settings, mt5: MT5Client, journal: Journal | None = None) -> Starlette:
     rules = limites.RiskRules(settings.risk_per_trade_pct, settings.daily_loss_pct, settings.weekly_loss_pct)
+    # Só leitura: sem calendário nem medição de contexto, que só a sincronização (pelo chat) usa.
+    journal = journal or Journal(settings.journal_path, settings.journal_export_dir, mt5)
 
     def handle(func):  # noqa: ANN001, ANN202
         def endpoint(request: Request) -> JSONResponse:
@@ -119,6 +142,36 @@ def create_app(settings: Settings, mt5: MT5Client) -> Starlette:
         report.pop("observacoes", None)
         return {"limites": limits, "posicoes": report}
 
+    def journal_view(request: Request) -> dict[str, Any]:
+        days = _days(request)
+        symbol = request.query_params.get("simbolo", "").strip()
+        setup = request.query_params.get("setup", "").strip()
+        try:
+            stats = journal.stats(days=days, symbol=symbol, setup=setup)
+            every = journal.list_operations(days=None, limit=1_000_000)
+        except JournalError as exc:  # journal vazio ou ilegível: a tela explica como sincronizar
+            return {"vazio": True, "mensagem": str(exc)}
+        # As mesmas operações das estatísticas (fechadas, filtradas pelo fechamento), da mais antiga para a mais nova.
+        cutoff = tempo.iso_utc(mt5.now_utc() - timedelta(days=days)) if days else None
+        closed = [
+            {k: o.get(k) for k in _OPERATION_FIELDS}
+            for o in every["operacoes"]
+            if o["status"] == "fechada"
+            and (not symbol or o["simbolo"].upper().startswith(symbol.upper()))
+            and (not setup or (o["setup"] or "").lower() == setup.lower())
+            and (cutoff is None or o["fechamento"]["utc"] >= cutoff)
+        ]
+        closed.sort(key=lambda o: (o["fechamento"]["utc"], o["id"]))
+        stats["avisos"] = [n for n in stats.pop("observacoes", []) if n not in journal_module.STATS_NOTES]
+        return {
+            "estatisticas": stats,
+            "operacoes": closed,
+            "simbolos_existentes": sorted({o["simbolo"] for o in every["operacoes"]}),
+            "setups_existentes": every["setups_existentes"],
+            "abertas_ou_parciais": sum(1 for o in every["operacoes"] if o["status"] != "fechada"),
+            "agora": tempo.iso_utc(mt5.now_utc()),
+        }
+
     def index(request: Request) -> FileResponse:
         return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-store"})
 
@@ -129,6 +182,7 @@ def create_app(settings: Settings, mt5: MT5Client) -> Starlette:
         Route("/api/estrutura", handle(structure)),
         Route("/api/ao_vivo", handle(live)),
         Route("/api/risco", handle(risk)),
+        Route("/api/journal", handle(journal_view)),
         Mount("/static", StaticFiles(directory=STATIC_DIR), name="static"),
     ]
     return Starlette(routes=routes, middleware=[Middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)])

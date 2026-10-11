@@ -12,7 +12,7 @@ import fake_mt5 as fm
 from fake_mt5 import FakeMT5, make_position, make_symbol
 from test_mt5_client import make_client
 from test_smc import frame, path
-from trading_mcp import indicators, smc
+from trading_mcp import indicators, journal as journal_module, smc
 from trading_mcp.config import Settings
 from trading_mcp.painel import app as painel_app, graficos
 
@@ -156,6 +156,48 @@ def test_api_risk_returns_limits_and_positions_together():
     assert out["posicoes"]["posicoes"][0]["stop"]["preco"] == 29950.0
     assert out["limites"]["exposicao_aberta"]["posicoes"] == 1
     assert out["limites"]["regras"]["dia_pct"] == Settings().daily_loss_pct
+
+
+def _journal_api(tmp_path, sync: bool = True):
+    from test_journal import _journal
+
+    journal, client, _ = _journal(tmp_path)
+    if sync:
+        journal.sync(7)
+        journal.annotate(ticket=100, setup="OB")
+    app = painel_app.create_app(Settings(), client, journal=journal)
+    return TestClient(app, base_url="http://127.0.0.1"), journal
+
+
+def test_api_journal_matches_the_stats_and_lists_closed_trades_in_order(tmp_path):
+    http, journal = _journal_api(tmp_path)
+    out = http.get("/api/journal").json()
+    assert out["estatisticas"]["geral"] == journal.stats()["geral"]
+    # Fechadas, da mais antiga para a mais nova pelo fechamento: a 200 fechou há 2,5 h e a 100 há 1 h.
+    assert [o["ticket"] for o in out["operacoes"]] == [200, 100]
+    assert out["operacoes"][1]["setup"] == "OB" and out["operacoes"][1]["r"] == 0.19
+    assert set(out["operacoes"][0]) == set(painel_app._OPERATION_FIELDS)
+    assert out["simbolos_existentes"] == ["EURUSD"] and out["setups_existentes"] == ["OB"]
+    assert out["abertas_ou_parciais"] == 1
+    assert "observacoes" not in out["estatisticas"]
+    assert out["estatisticas"]["avisos"] and not set(out["estatisticas"]["avisos"]) & set(journal_module.STATS_NOTES)
+
+
+def test_api_journal_filters_agree_with_the_stats(tmp_path):
+    http, _ = _journal_api(tmp_path)
+    for params in ({"dias": "0.1"}, {"setup": "ob"}, {"simbolo": "eur"}, {"simbolo": "GBP"}):
+        out = http.get("/api/journal", params=params).json()
+        assert len(out["operacoes"]) == out["estatisticas"]["geral"]["operacoes"], params
+    assert [o["ticket"] for o in http.get("/api/journal", params={"dias": "0.1"}).json()["operacoes"]] == [100]
+    assert http.get("/api/journal", params={"dias": "abc"}).status_code == 400
+    assert http.get("/api/journal", params={"dias": "0"}).status_code == 400
+
+
+def test_api_journal_empty_explains_and_creates_nothing(tmp_path):
+    http, journal = _journal_api(tmp_path, sync=False)
+    out = http.get("/api/journal").json()
+    assert out["vazio"] is True and "journal_sincronizar" in out["mensagem"]
+    assert not journal._path.exists()
 
 
 def test_api_errors_become_messages(api):

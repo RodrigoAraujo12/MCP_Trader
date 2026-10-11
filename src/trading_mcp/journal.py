@@ -117,7 +117,7 @@ CREATE TABLE IF NOT EXISTS negocios (
 # Colunas acrescentadas depois da versão 1 (migração com ALTER TABLE).
 _ADDED_COLUMNS = {"noticia_ate_utc": "TEXT", "contexto_entrada": "TEXT", "contexto_versao": "INTEGER"}
 
-_STATS_NOTES = [
+STATS_NOTES = [
     "Só operações fechadas entram nas estatísticas.",
     "Taxa de acerto = ganhos / operações (empates contam no total). Resultado líquido = preço + comissão + "
     "swap + taxas. fator_lucro nulo = nenhuma perda no grupo.",
@@ -921,7 +921,7 @@ class Journal:
             synced = self._meta(conn, f"sincronizado:{login}:{server}")
         for r in rows:
             r["r"] = _r_multiple(r)
-        notes = list(_STATS_NOTES)
+        notes = list(STATS_NOTES)
         if not_closed:
             notes.append(f"{not_closed} operação(ões) aberta(s) ou parcialmente fechada(s) ficaram de fora.")
         general = _stats(rows)

@@ -40,6 +40,14 @@
     simbolo: (url.searchParams.get('simbolo') || 'USTEC').toUpperCase(),
     tf: TIMEFRAMES.includes((url.searchParams.get('tf') || '').toUpperCase()) ? url.searchParams.get('tf').toUpperCase() : 'M5',
     fuso: FUSOS.find((f) => f.id === url.searchParams.get('fuso')) || FUSOS[0],
+    vista: url.searchParams.get('vista') === 'journal' ? 'journal' : 'mercado',
+    journal: {
+      dias: ['7', '30', '90'].includes(url.searchParams.get('periodo')) ? url.searchParams.get('periodo') : '',
+      simbolo: url.searchParams.get('jsimbolo') || '',
+      setup: url.searchParams.get('jsetup') || '',
+      unidade: 'r',
+      dados: null,
+    },
     camadas: lerCamadas(),
     geracao: 0,
     grafico: null,       // resposta de /api/grafico
@@ -67,6 +75,11 @@
     u.searchParams.set('simbolo', estado.simbolo);
     u.searchParams.set('tf', estado.tf);
     u.searchParams.set('fuso', estado.fuso.id);
+    u.searchParams.set('vista', estado.vista);
+    const j = estado.journal;
+    for (const [chave, valor] of [['periodo', j.dias], ['jsimbolo', j.simbolo], ['jsetup', j.setup]]) {
+      if (valor) u.searchParams.set(chave, valor); else u.searchParams.delete(chave);
+    }
     history.replaceState(null, '', u);
   }
 
@@ -852,6 +865,290 @@
     linhasPosicoes = linhas.map((l) => velas.createPriceLine({ ...l, lineWidth: 1, axisLabelVisible: true }));
   }
 
+  // ------------------------------------------------------------------ journal
+  const PERIODOS = [{ id: '7', rotulo: '7 dias' }, { id: '30', rotulo: '30 dias' }, { id: '90', rotulo: '90 dias' },
+    { id: '', rotulo: 'Tudo' }];
+  const DIMENSOES = {
+    sessao: 'Sessão', estrutura_M5: 'Estrutura micro M5', estrutura_M15: 'Estrutura micro M15',
+    estrutura_H1: 'Estrutura micro H1', estrutura_H4: 'Estrutura micro H4', estrutura_macro_H1: 'Estrutura macro H1',
+    varredura_a_favor: 'Varredura de liquidez a favor', choch_a_favor: 'CHoCH a favor', choch_contra: 'CHoCH contra',
+    zona_a_favor: 'Zona a favor (OB/FVG)', zona_contra: 'Zona contra (OB/FVG)',
+    premium_discount_M15: 'Premium/discount M15', premium_discount_H1: 'Premium/discount H1',
+  };
+  const OUTROS = { por_setup: 'Setup', por_simbolo: 'Símbolo', por_direcao: 'Direção', por_noticia: 'Notícia no período', por_tag: 'Tag' };
+  const VALORES = {
+    a_favor: 'a favor', contra: 'contra', indefinida: 'indefinida', sem_dados: 'sem dados', sem_faixa: 'sem faixa',
+    nova_york: 'Nova York', londres: 'Londres', asia: 'Ásia', fora: 'fora das sessões', nenhuma: 'nenhuma',
+    nenhum: 'nenhum', sim: 'sim', nao: 'não', nivel_chave: 'nível-chave (dia, semana, sessão)',
+    liquidez_igual: 'topos/fundos iguais', topo_fundo: 'topo/fundo', topo_fundo_m1_m3: 'topo/fundo no M1/M3',
+    equilibrio: 'equilíbrio', fora_da_faixa: 'fora da faixa', desconhecido: 'desconhecido', compra: 'compra',
+    venda: 'venda',
+  };
+  const valor = (v) => (v in VALORES ? VALORES[v] : String(v).replace(/_/g, ' '));
+  const moedaConta = () => (ultimoRisco && ultimoRisco.limites.conta.moeda) || 'USD';
+  const rTexto = (v) => (v == null ? '-' : `${numero(v, 2, true)} R`);
+
+  let graficoJournal = null, serieAcumulada = null, serieOperacoes = null;
+  let pontosCurva = [];
+
+  async function carregarJournal() {
+    const j = estado.journal;
+    $('#journal-estado').hidden = !!j.dados;
+    try {
+      const d = await api('/api/journal', { dias: j.dias, simbolo: j.simbolo, setup: j.setup });
+      j.dados = d;
+      renderJournal(d);
+    } catch (e) {
+      $('#journal-conteudo').hidden = true;
+      $('#journal-estado').hidden = false;
+      $('#journal-estado').textContent = `Não foi possível ler o journal: ${e.message}`;
+    }
+  }
+
+  function renderJournal(d) {
+    if (d.vazio) {
+      $('#journal-conteudo').hidden = true;
+      $('#journal-estado').hidden = false;
+      $('#journal-estado').textContent = `${d.mensagem} No chat, peça ao Claude: “sincronize o journal”.`;
+      $('#sinc').textContent = '';
+      return;
+    }
+    const st = d.estatisticas, g = st.geral, moeda = moedaConta();
+    // Sincronização: o painel só lê; quem importa as operações do MT5 é o journal_sincronizar, pelo chat.
+    const sinc = st.ultima_sincronizacao;
+    const idadeS = sinc ? (Date.parse(d.agora) - Date.parse(sinc.utc)) / 1000 : null;
+    $('#sinc').textContent = sinc
+      ? `Sincronizado em ${dataHora(Date.parse(sinc.utc) / 1000)} (há ${idade(idadeS)}). Para atualizar, peça ao Claude para sincronizar o journal.`
+      : 'Ainda não sincronizado.';
+    $('#sinc').classList.toggle('velha', idadeS != null && idadeS > 86400);
+    preencherFiltro('#filtro-simbolo', d.simbolos_existentes, estado.journal.simbolo);
+    preencherFiltro('#filtro-setup', d.setups_existentes, estado.journal.setup);
+
+    $('#journal-estado').hidden = true;
+    $('#journal-conteudo').hidden = false;
+    const amostra = $('#aviso-amostra');
+    amostra.hidden = !g.amostra_pequena;
+    amostra.textContent = g.operacoes
+      ? `Amostra pequena: ${g.operacoes} operaç${g.operacoes === 1 ? 'ão fechada' : 'ões fechadas'} (menos de 20). Os números descrevem o que aconteceu e não sustentam uma regra.`
+      : 'Nenhuma operação fechada com estes filtros.';
+    if (!g.operacoes) amostra.hidden = false;
+
+    const kpi = (rotulo, valorHtml, detalhe = '') => `<div class="kpi"><dt>${rotulo}</dt><dd class="num">${valorHtml}${detalhe ? `<small>${detalhe}</small>` : ''}</dd></div>`;
+    $('#journal-kpis').innerHTML = [
+      kpi('Operações', g.operacoes, `${g.ganhos} ganho${g.ganhos === 1 ? '' : 's'}, ${g.perdas} perda${g.perdas === 1 ? '' : 's'}${g.empates ? `, ${g.empates} empate${g.empates === 1 ? '' : 's'}` : ''}`),
+      kpi('Acerto', g.taxa_acerto_pct == null ? '-' : `${numero(g.taxa_acerto_pct, 1)}%`),
+      kpi('Resultado líquido', `<span class="${classeResultado(g.resultado_liquido)}">${dinheiro(g.resultado_liquido, moeda, { sinal: true })}</span>`,
+        g.resultado_medio == null ? '' : `média ${dinheiro(g.resultado_medio, moeda, { sinal: true })}`),
+      kpi('R total', `<span class="${classeResultado(g.r.r_total)}">${rTexto(g.r.r_total)}</span>`,
+        g.r.r_medio == null ? '' : `médio ${rTexto(g.r.r_medio)}${g.r.sem_risco_inicial ? `, ${g.r.sem_risco_inicial} sem stop inicial` : ''}`),
+      kpi('Fator de lucro', g.fator_lucro == null ? (g.ganhos ? 'sem perdas' : '-') : numero(g.fator_lucro, 2)),
+      kpi('Ganho médio', dinheiro(g.ganho_medio, moeda), g.maior_ganho == null ? '' : `maior ${dinheiro(g.maior_ganho, moeda)}`),
+      kpi('Perda média', dinheiro(g.perda_media, moeda), g.maior_perda == null ? '' : `maior ${dinheiro(g.maior_perda, moeda)}`),
+    ].join('');
+
+    desenharCurva();
+    const todos = [...Object.values(st.por_contexto), ...Object.keys(OUTROS).map((k) => st[k] || [])].flat();
+    const escala = Math.max(0.5, ...todos.map((x) => Math.abs(x.r_medio || 0)));
+    $('#por-contexto').innerHTML = Object.entries(st.por_contexto)
+      .map(([nome, grupos]) => dimensao(DIMENSOES[nome] || valor(nome), grupos, escala, moeda)).join('') +
+      (st.operacoes_sem_contexto ? `<p class="nota">${st.operacoes_sem_contexto} operação(ões) sem contexto medido ficaram de fora.</p>` : '');
+    $('#por-outros').innerHTML = Object.entries(OUTROS)
+      .map(([chave, nome]) => dimensao(nome, st[chave] || [], escala, moeda)).join('');
+    renderOperacoes(d.operacoes, moeda);
+    const notas = [...st.avisos];
+    if (d.abertas_ou_parciais && !notas.some((n) => n.includes('aberta'))) {
+      notas.push(`${d.abertas_ou_parciais} operação(ões) abertas ou parciais não entram nas estatísticas.`);
+    }
+    $('#nota-curva').textContent = notaCurva() + (notas.length ? ` ${notas.join(' ')}` : '');
+  }
+
+  function preencherFiltro(sel, opcoes, atual) {
+    const el = $(sel);
+    const lista = atual && !opcoes.includes(atual) ? [...opcoes, atual] : opcoes;
+    el.innerHTML = '<option value="">Todos</option>' + lista.map((o) => `<option value="${esc(o)}">${esc(o)}</option>`).join('');
+    el.value = atual;
+  }
+
+  const GRUPOS_VISIVEIS = 6;  // o resto (em geral grupos de 1 operação) fica recolhido
+  function dimensao(titulo, grupos, escala, moeda) {
+    if (!grupos.length) return '';
+    const linha = (x) => {
+      const largura = x.r_medio == null ? 0 : Math.min(50, (Math.abs(x.r_medio) / escala) * 50);
+      const barra = x.r_medio == null ? '' : `<span class="${x.r_medio >= 0 ? 'pos' : 'neg'}" style="width:${largura}%"></span>`;
+      const dica = `${x.operacoes} operaç${x.operacoes === 1 ? 'ão' : 'ões'}, ${x.operacoes_com_r} com R. ` +
+        `Acerto ${x.taxa_acerto_pct == null ? '-' : `${numero(x.taxa_acerto_pct, 1)}%`}, R médio ${rTexto(x.r_medio)}, resultado ${dinheiro(x.resultado_liquido, moeda, { sinal: true })}.`;
+      return `<div class="grupo" title="${esc(dica)}"><span class="nome">${esc(valor(x.grupo))}</span>` +
+        `<span class="n">${x.operacoes}</span><span class="acerto">${x.taxa_acerto_pct == null ? '-' : `${Math.round(x.taxa_acerto_pct)}%`}</span>` +
+        `<span class="barra-r" aria-hidden="true">${barra}</span>` +
+        `<span class="rm${x.r_medio == null ? ' sem' : ''}">${x.r_medio == null ? '-' : numero(x.r_medio, 2, true)}</span>` +
+        `<span class="res ${classeResultado(x.resultado_liquido)}">${dinheiro(x.resultado_liquido, moeda, { sinal: true })}</span></div>`;
+    };
+    // Com 1 a mais que o limite, mostra todos: recolher uma linha só não ajuda.
+    const corte = grupos.length > GRUPOS_VISIVEIS + 1 ? GRUPOS_VISIVEIS : grupos.length;
+    const resto = grupos.slice(corte);
+    return `<div class="dimensao"><h3>${esc(titulo)}</h3>` +
+      '<div class="grupo cab-grupo" aria-hidden="true"><span></span><span>n</span><span>acerto</span><span></span><span>R médio</span><span>resultado</span></div>' +
+      grupos.slice(0, corte).map(linha).join('') +
+      (resto.length ? `<details class="mais"><summary>Mostrar mais ${resto.length}</summary>${resto.map(linha).join('')}</details>` : '') +
+      '</div>';
+  }
+
+  function notaCurva() {
+    const ops = (estado.journal.dados && estado.journal.dados.operacoes) || [];
+    if (estado.journal.unidade === 'r') {
+      const sem = ops.filter((o) => o.r == null).length;
+      return `Em R: resultado líquido dividido pelo risco até o stop inicial${sem ? `; ${sem} operação(ões) sem stop inicial ficam de fora` : ''}.`;
+    }
+    return 'Em dinheiro: resultado líquido, com comissão, swap e taxas.';
+  }
+
+  function desenharCurva() {
+    const d = estado.journal.dados;
+    if (!d || d.vazio) return;
+    if (!graficoJournal) {
+      graficoJournal = LW.createChart($('#curva'), {
+        autoSize: true,
+        layout: { background: { type: 'solid', color: COR.surface }, textColor: COR.sutil, fontFamily: FONTE_MONO, fontSize: 11,
+          attributionLogo: true, panes: { separatorColor: COR.borda } },
+        grid: { vertLines: { visible: false }, horzLines: { color: COR.grid } },
+        rightPriceScale: { borderColor: COR.borda },
+        timeScale: { borderColor: COR.borda, timeVisible: false, rightOffset: 4, fixLeftEdge: true, fixRightEdge: true },
+        crosshair: { mode: LW.CrosshairMode.Magnet,
+          vertLine: { color: 'rgba(255,255,255,0.25)', labelBackgroundColor: '#2a2f36' },
+          horzLine: { color: 'rgba(255,255,255,0.25)', labelBackgroundColor: '#2a2f36' } },
+        handleScroll: false, handleScale: false,
+      });
+      serieAcumulada = graficoJournal.addSeries(LW.BaselineSeries, {
+        baseValue: { type: 'price', price: 0 }, lineWidth: 2,
+        topLineColor: COR.alta, topFillColor1: alpha(COR.alta, 0.22), topFillColor2: alpha(COR.alta, 0.02),
+        bottomLineColor: COR.baixa, bottomFillColor1: alpha(COR.baixa, 0.02), bottomFillColor2: alpha(COR.baixa, 0.22),
+        priceLineVisible: false, lastValueVisible: true, pointMarkersVisible: true, pointMarkersRadius: 3,
+      });
+      serieOperacoes = graficoJournal.addSeries(LW.HistogramSeries, { priceLineVisible: false, lastValueVisible: false }, 1);
+      graficoJournal.panes()[0].setStretchFactor(0.72);
+      graficoJournal.panes()[1].setStretchFactor(0.28);
+      graficoJournal.subscribeCrosshairMove((param) => {
+        const p = param && param.time != null ? pontosCurva.find((x) => x.time === param.time) : null;
+        legendaCurva(p || pontosCurva[pontosCurva.length - 1]);
+      });
+    }
+    const emR = estado.journal.unidade === 'r';
+    const moeda = moedaConta();
+    const fmt = emR ? (v) => numero(v, 2, true) : (v) => dinheiro(v, moeda, { sinal: true });
+    graficoJournal.applyOptions({ localization: { locale: 'pt-BR', priceFormatter: fmt,
+      timeFormatter: (t) => fmtData({ day: '2-digit', month: '2-digit', year: '2-digit', hour: '2-digit', minute: '2-digit' }).format(new Date(t * 1000)) },
+      // Várias operações no mesmo dia: a marca de hora (tipo 3) mostra a hora em vez de repetir a data.
+      timeScale: { tickMarkFormatter: (t, tipo) => fmtData(tipo >= 3 ? { hour: '2-digit', minute: '2-digit' } : { day: '2-digit', month: '2-digit' })
+        .format(new Date(t * 1000)) } });
+    // Um ponto por operação, na ordem do fechamento (horários repetidos andam 1 s para a curva aceitar).
+    let acumulado = 0, ultimo = 0;
+    pontosCurva = [];
+    for (const o of d.operacoes) {
+      const v = emR ? o.r : o.resultado_liquido;
+      if (v == null) continue;
+      acumulado += v;
+      let t = Math.floor(Date.parse(o.fechamento.utc) / 1000);
+      if (t <= ultimo) t = ultimo + 1;
+      ultimo = t;
+      pontosCurva.push({ time: t, valor: v, acumulado: Math.round(acumulado * 100) / 100, op: o });
+    }
+    // A curva parte do zero, um instante antes da primeira operação (sem barra nesse ponto).
+    const origem = pontosCurva.length ? [{ time: pontosCurva[0].time - 60 }] : [];
+    serieAcumulada.setData([...origem.map((o) => ({ ...o, value: 0 })), ...pontosCurva.map((p) => ({ time: p.time, value: p.acumulado }))]);
+    serieOperacoes.setData([...origem, ...pontosCurva.map((p) => ({ time: p.time, value: p.valor, color: p.valor >= 0 ? alpha(COR.alta, 0.85) : alpha(COR.baixa, 0.85) }))]);
+    graficoJournal.timeScale().fitContent();
+    $('#curva').setAttribute('aria-label', pontosCurva.length
+      ? `Resultado acumulado ${emR ? 'em R' : 'em dinheiro'} em ${pontosCurva.length} operações: ${fmt(acumulado)} no fim.`
+      : 'Sem operações para a curva.');
+    legendaCurva(pontosCurva[pontosCurva.length - 1]);
+    $('#nota-curva').textContent = notaCurva();
+  }
+
+  function legendaCurva(p) {
+    const el = $('#legenda-curva');
+    if (!p) { el.innerHTML = ''; return; }
+    const o = p.op, moeda = moedaConta();
+    const emR = estado.journal.unidade === 'r';
+    const fmt = (v) => (emR ? rTexto(v) : dinheiro(v, moeda, { sinal: true }));
+    el.innerHTML = `<b>${esc(o.simbolo)}</b><span class="rot">${esc(o.direcao)}</span><span class="rot">${esc(dataHora(Date.parse(o.fechamento.utc) / 1000))}</span>` +
+      `<span class="${classeResultado(p.valor)}">${fmt(p.valor)}</span><span><span class="rot">acumulado</span> ${fmt(p.acumulado)}</span>`;
+  }
+
+  function renderOperacoes(ops, moeda) {
+    const linhas = ops.slice().reverse().map((o) => {
+      const c = o.contexto || {};
+      const contexto = o.contexto
+        ? [valor(c.sessao), `macro H1 ${valor(c.estrutura_macro_H1)}`, `zona ${valor(c.zona_a_favor)}`, `varredura ${valor(c.varredura_a_favor)}`].join(', ')
+        : 'sem contexto';
+      const notas = [o.setup, o.tags].filter(Boolean).join('; ');
+      return `<tr><td>${esc(dataHora(Date.parse(o.fechamento.utc) / 1000))}<div class="ctx">${esc(o.duracao || '')}</div></td>` +
+        `<td translate="no">${esc(o.simbolo)}</td><td><span class="etiqueta ${o.direcao}">${o.direcao === 'compra' ? 'Compra' : 'Venda'}</span></td>` +
+        `<td class="num">${numero(o.volume, 2)}</td>` +
+        `<td class="num ${classeResultado(o.resultado_liquido)}">${dinheiro(o.resultado_liquido, moeda, { sinal: true })}</td>` +
+        `<td class="num ${classeResultado(o.r)}">${o.r == null ? '-' : numero(o.r, 2, true)}</td>` +
+        `<td>${notas ? esc(notas) : '<span class="sutil">sem anotação</span>'}${o.noticia === 'sim' ? '<div class="ctx">com notícia</div>' : ''}</td>` +
+        `<td class="ctx">${esc(contexto)}</td></tr>`;
+    }).join('');
+    $('#tabela-operacoes').innerHTML = '<thead><tr><th scope="col">Fechamento</th><th scope="col">Símbolo</th><th scope="col">Direção</th>' +
+      '<th scope="col" class="num">Lotes</th><th scope="col" class="num">Resultado</th><th scope="col" class="num">R</th>' +
+      `<th scope="col">Setup e tags</th><th scope="col">Contexto na entrada</th></tr></thead><tbody>${linhas || '<tr><td colspan="8" class="sutil">Nenhuma operação.</td></tr>'}</tbody>`;
+  }
+
+  function montarPeriodos() {
+    $('#periodos').innerHTML = PERIODOS.map((p) =>
+      `<button type="button" data-periodo="${p.id}" aria-pressed="${p.id === estado.journal.dias}">${p.rotulo}</button>`).join('');
+  }
+  $('#periodos').addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-periodo]');
+    if (!b || b.dataset.periodo === estado.journal.dias) return;
+    estado.journal.dias = b.dataset.periodo;
+    montarPeriodos();
+    atualizarUrl();
+    carregarJournal();
+  });
+  for (const [sel, chave] of [['#filtro-simbolo', 'simbolo'], ['#filtro-setup', 'setup']]) {
+    $(sel).addEventListener('change', (e) => {
+      estado.journal[chave] = e.target.value;
+      atualizarUrl();
+      carregarJournal();
+    });
+  }
+  $('#unidade').addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-unidade]');
+    if (!b || b.dataset.unidade === estado.journal.unidade) return;
+    estado.journal.unidade = b.dataset.unidade;
+    for (const x of $('#unidade').querySelectorAll('button')) x.setAttribute('aria-pressed', String(x === b));
+    desenharCurva();
+  });
+
+  function mostrarVista(vista) {
+    estado.vista = vista;
+    document.body.dataset.vista = vista;
+    const journal = vista === 'journal';
+    document.querySelector('main.area').hidden = journal;
+    $('#vista-journal').hidden = !journal;
+    for (const a of document.querySelectorAll('.vistas a')) {
+      if (a.dataset.vista === vista) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
+    }
+    atualizarUrl();
+    // Um gráfico criado ou deixado escondido (display: none) fica com tamanho zero: ao reaparecer, ele mede de novo.
+    requestAnimationFrame(() => remedir(journal ? graficoJournal : grafico, journal ? '#curva' : '#grafico'));
+    if (journal) carregarJournal();
+  }
+  function remedir(g, seletor) {
+    const el = $(seletor);
+    if (!g || !el.clientWidth) return;
+    g.applyOptions({ autoSize: false });
+    g.resize(el.clientWidth, el.clientHeight);
+    g.applyOptions({ autoSize: true });
+  }
+  document.querySelector('.vistas').addEventListener('click', (e) => {
+    const a = e.target.closest('a[data-vista]');
+    if (!a || e.ctrlKey || e.metaKey || e.shiftKey || e.button !== 0) return;  // Ctrl+clique abre em outra aba
+    e.preventDefault();
+    if (a.dataset.vista !== estado.vista) mostrarVista(a.dataset.vista);
+  });
+
   // ------------------------------------------------------------------ controles
   function montarTimeframes() {
     $('#timeframes').innerHTML = TIMEFRAMES.map((tf, i) =>
@@ -906,6 +1203,7 @@
     atualizarUrl();
     grafico.applyOptions(formatadores());
     if (estado.estrutura) { renderSessoes(estado.estrutura); renderDiaSemana(estado.estrutura); }
+    if (estado.journal.dados) renderJournal(estado.journal.dados);
     legenda(estado.velas[estado.velas.length - 1]);
   });
   $('#camadas').addEventListener('click', (e) => {
@@ -928,7 +1226,7 @@
   $('#campo-simbolo').addEventListener('change', () => $('#form-simbolo').requestSubmit());
   $('#tentar-de-novo').addEventListener('click', () => trocar());
   document.addEventListener('keydown', (e) => {
-    if (e.ctrlKey || e.metaKey || e.altKey || e.target.closest('input, textarea, select')) return;
+    if (estado.vista !== 'mercado' || e.ctrlKey || e.metaKey || e.altKey || e.target.closest('input, textarea, select')) return;
     const n = Number(e.key);
     if (n >= 1 && n <= TIMEFRAMES.length && TIMEFRAMES[n - 1] !== estado.tf) trocar({ tf: TIMEFRAMES[n - 1] });
   });
@@ -940,11 +1238,13 @@
   (async () => {
     montarFusos();
     montarCamadas();
+    montarPeriodos();
     try {
       const cfg = await api('/api/config');
       $('#lista-simbolos').innerHTML = cfg.instrumentos.map((s) => `<option value="${esc(s)}"></option>`).join('');
     } catch { /* sem a lista, o campo continua aceitando qualquer símbolo */ }
     carregarRisco();  // antes da estrutura, que é lenta e disputa a mesma conexão com o MT5
     trocar();
+    if (estado.vista === 'journal') mostrarVista('journal');
   })();
 })();
