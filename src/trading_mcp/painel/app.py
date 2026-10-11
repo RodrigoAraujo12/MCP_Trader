@@ -21,7 +21,7 @@ from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
-from trading_mcp import smc, tempo
+from trading_mcp import limites, smc, tempo
 from trading_mcp.config import Settings
 from trading_mcp.mt5_client import MT5Client, MT5Error, SymbolNotFoundError
 from trading_mcp.painel import graficos
@@ -64,6 +64,8 @@ def _timeframe(request: Request, default: str = "M5") -> str:
 
 
 def create_app(settings: Settings, mt5: MT5Client) -> Starlette:
+    rules = limites.RiskRules(settings.risk_per_trade_pct, settings.daily_loss_pct, settings.weekly_loss_pct)
+
     def handle(func):  # noqa: ANN001, ANN202
         def endpoint(request: Request) -> JSONResponse:
             try:
@@ -110,6 +112,13 @@ def create_app(settings: Settings, mt5: MT5Client) -> Starlette:
             "agora": graficos.epoch(mt5.now_utc()),
         }
 
+    def risk(request: Request) -> dict[str, Any]:
+        # Limites e posições da mesma leitura; as notas fixas ficam no README e na documentação das tools.
+        limits, report = limites.limits_and_positions(mt5, rules)
+        limits.pop("observacoes", None)
+        report.pop("observacoes", None)
+        return {"limites": limits, "posicoes": report}
+
     def index(request: Request) -> FileResponse:
         return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-store"})
 
@@ -119,6 +128,7 @@ def create_app(settings: Settings, mt5: MT5Client) -> Starlette:
         Route("/api/grafico", handle(chart)),
         Route("/api/estrutura", handle(structure)),
         Route("/api/ao_vivo", handle(live)),
+        Route("/api/risco", handle(risk)),
         Mount("/static", StaticFiles(directory=STATIC_DIR), name="static"),
     ]
     return Starlette(routes=routes, middleware=[Middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)])

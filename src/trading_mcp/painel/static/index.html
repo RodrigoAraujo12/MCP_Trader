@@ -35,6 +35,18 @@
     </div>
   </header>
 
+  <section class="conta" id="conta" aria-label="Conta e limites de risco">
+    <div class="alerta-conta" id="alerta-conta" role="alert" hidden></div>
+    <dl class="kpis">
+      <div class="kpi"><dt>Conta</dt><dd id="kpi-conta" class="sutil">Carregando…</dd></div>
+      <div class="kpi"><dt>Saldo</dt><dd id="kpi-saldo" class="num">-</dd></div>
+      <div class="kpi"><dt>Resultado aberto</dt><dd id="kpi-aberto" class="num">-</dd></div>
+      <div class="kpi medidor-kpi"><dt>Dia <span class="sutil" id="regra-dia"></span></dt><dd id="medidor-dia"></dd></div>
+      <div class="kpi medidor-kpi"><dt>Semana <span class="sutil" id="regra-semana"></span></dt><dd id="medidor-semana"></dd></div>
+      <div class="kpi"><dt>Próxima operação</dt><dd id="kpi-proxima" class="num">-</dd></div>
+    </dl>
+  </section>
+
   <main class="area">
     <section class="grafico-bloco" aria-labelledby="titulo-grafico">
       <div class="barra-grafico">
@@ -55,7 +67,12 @@
       </div>
     </section>
 
-    <aside class="lateral" id="lateral" tabindex="-1" aria-label="Leitura da estrutura">
+    <aside class="lateral" id="lateral" tabindex="-1" aria-label="Posições e leitura da estrutura">
+      <section class="secao">
+        <h2>Posições e ordens <span class="sutil" id="contagem-posicoes"></span></h2>
+        <div id="posicoes"><p class="sutil">Carregando…</p></div>
+      </section>
+
       <section class="secao">
         <h2>Estrutura <span class="sutil">por fechamento</span></h2>
         <table class="tabela" id="tabela-estrutura">

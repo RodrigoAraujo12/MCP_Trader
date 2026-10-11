@@ -185,6 +185,13 @@ def _period(deals: list[dict[str, Any]], start: datetime, balance: float, pct: f
 def account_limits(mt5: MT5Client, rules: RiskRules, now: datetime | None = None) -> dict[str, Any]:
     """Painel dos limites: saldo do início do dia e da semana de mercado, resultado, exposição nos stops e quanto
     ainda cabe na próxima operação."""
+    return limits_and_positions(mt5, rules, now)[0]
+
+
+def limits_and_positions(mt5: MT5Client, rules: RiskRules,
+                         now: datetime | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Os limites e o relatório de posições (``posicoes.build``) da mesma leitura do MT5, para mostrar os dois juntos
+    sem que um stop atingido entre duas leituras apareça num e não no outro."""
     moment = now or mt5.now_utc()
     day_start, week_start = smc.market_day_start(moment), smc.market_week_start(moment)
     # Posições primeiro, depois o histórico e por fim o saldo: um stop atingido no meio das leituras aparece no
@@ -221,7 +228,7 @@ def account_limits(mt5: MT5Client, rules: RiskRules, now: datetime | None = None
     if no_stop:
         warnings.append(f"{no_stop} posição(ões)/ordem(ns) sem stop: coloque o stop para os limites voltarem a valer.")
     warnings += [w for w in report.get("avisos", []) if "NÃO é demo" not in w and "sem conexão" not in w]
-    return {
+    limits = {
         "conta": {"login": account["login"], "servidor": account["servidor"], "tipo_conta": account["tipo_conta"],
                   "is_demo": account["is_demo"], "conectado": account["conectado"], "moeda": account["moeda"],
                   "saldo": account["saldo"], "equity": account["equity"], "margem_livre": account["margem_livre"]},
@@ -244,6 +251,7 @@ def account_limits(mt5: MT5Client, rules: RiskRules, now: datetime | None = None
         "avisos": warnings,
         "observacoes": NOTES[1:3],
     }
+    return limits, report
 
 
 # --------------------------------------------------------------------------- propostas

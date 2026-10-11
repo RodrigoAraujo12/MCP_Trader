@@ -9,7 +9,7 @@ import pytest
 from starlette.testclient import TestClient
 
 import fake_mt5 as fm
-from fake_mt5 import FakeMT5, make_symbol
+from fake_mt5 import FakeMT5, make_position, make_symbol
 from test_mt5_client import make_client
 from test_smc import frame, path
 from trading_mcp import indicators, smc
@@ -32,10 +32,10 @@ def _walk(n: int, step_s: int = 300, seed: int = 7, end: datetime = NOW) -> np.n
     return np.array(rows, dtype=fm.RATES_DTYPE)
 
 
-def _index_client(n: int = 4100):
+def _index_client(n: int = 4100, **fake_kwargs):
     index = make_symbol("USTECm", digits=2, point=0.01, bid=30000.0, ask=30001.12,
                         trade_calc_mode=fm.SYMBOL_CALC_MODE_CFD, currency_base="USD", currency_profit="USD")
-    client, fake = make_client(FakeMT5([index], rates={"USTECm": _walk(n)}))
+    client, fake = make_client(FakeMT5([index], rates={"USTECm": _walk(n)}, **fake_kwargs))
     return client, fake
 
 
@@ -143,6 +143,19 @@ def test_api_chart_structure_and_live(api):
     live = http.get("/api/ao_vivo", params={"simbolo": "USTEC", "tf": "M5"}).json()
     assert live["cotacao"]["simbolo"] == "USTECm" and len(live["candles"]) == 2
     assert live["ultimo_em_formacao"] is False and live["fecha_em"] is None
+
+
+def test_api_risk_returns_limits_and_positions_together():
+    position = make_position(9, "USTECm", "buy", 1.0, 29990.0, 30000.0, sl=29950.0, tp=30100.0, profit=10.0)
+    client, _ = _index_client(500, positions=[position])
+    http = TestClient(painel_app.create_app(Settings(), client), base_url="http://127.0.0.1")
+    out = http.get("/api/risco").json()
+    assert set(out) == {"limites", "posicoes"}
+    assert "observacoes" not in out["limites"] and "observacoes" not in out["posicoes"]
+    assert [p["ticket"] for p in out["posicoes"]["posicoes"]] == [9]
+    assert out["posicoes"]["posicoes"][0]["stop"]["preco"] == 29950.0
+    assert out["limites"]["exposicao_aberta"]["posicoes"] == 1
+    assert out["limites"]["regras"]["dia_pct"] == Settings().daily_loss_pct
 
 
 def test_api_errors_become_messages(api):

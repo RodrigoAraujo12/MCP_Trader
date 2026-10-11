@@ -188,6 +188,16 @@ def test_little_room_left_in_the_day_limits_the_next_trade():
     assert nxt["limitado_por"] == "dia" and nxt["risco_maximo"] == pytest.approx(494.9 - 150 - 300)
 
 
+def test_limits_and_positions_come_from_the_same_reading():
+    """O painel mostra os limites e as posições juntos: os limites são os mesmos da tool `risco_conta`."""
+    position = [make_position(700, EUR, "buy", 0.5, 1.099, 1.1, sl=1.097, profit=50.0)]  # perde 100 no stop
+    client, _ = _client(positions=position)
+    limits, report = limites.limits_and_positions(client, RULES)
+    assert limits == limites.account_limits(client, RULES)
+    assert [p["ticket"] for p in report["posicoes"]] == [700] and [o["ticket"] for o in report["pendentes"]] == [500]
+    assert limits["exposicao_aberta"]["perda_nos_stops_posicoes"] == report["totais"]["perda_nos_stops"] == 100.0
+
+
 def test_a_cent_of_room_is_no_room():
     start = datetime(2026, 9, 29, 21, tzinfo=UTC)
     out = limites._period([], start, 100.0, 5.0, 4.995, "dia")  # sobra meio centavo

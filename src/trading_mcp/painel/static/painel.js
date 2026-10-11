@@ -22,6 +22,7 @@
     { id: 'utc', rotulo: 'UTC', tz: 'UTC', nome: 'UTC' },
   ];
   const CAMADAS = [
+    { id: 'posicoes', rotulo: 'Posições', amostra: `height:0;border-top:2px solid ${COR.texto2}` },
     { id: 'ob', rotulo: 'Order blocks', amostra: `background:${alpha(COR.alta, 0.35)};box-shadow:inset 2px 0 0 ${COR.alta}` },
     { id: 'fvg', rotulo: 'FVG', amostra: `border:1px dashed ${COR.baixa};background:${alpha(COR.baixa, 0.12)}` },
     { id: 'estrutura', rotulo: 'BOS / CHoCH', amostra: `height:2px;background:${COR.alta}` },
@@ -427,6 +428,8 @@
       }
       velas.setData(estado.velas);
       camadaSmc.atualizar(d);
+      desenharPosicoes();
+      if (ultimoRisco) renderPosicoes(ultimoRisco.posicoes, ultimoRisco.limites.conta.moeda);
       if (vista) grafico.timeScale().setVisibleLogicalRange(vista);
       else grafico.timeScale().setVisibleLogicalRange({ from: estado.velas.length - 160, to: estado.velas.length + 12 });
       legenda(estado.velas[estado.velas.length - 1]);
@@ -656,7 +659,8 @@
   }
 
   function avisos() {
-    const lista = [...((estado.grafico && estado.grafico.avisos) || []), ...((estado.estrutura && estado.estrutura.avisos) || [])];
+    const lista = [...((ultimoRisco && ultimoRisco.limites.avisos) || []), ...((estado.grafico && estado.grafico.avisos) || []),
+      ...((estado.estrutura && estado.estrutura.avisos) || [])];
     const unicos = [...new Set(lista)];
     $('#secao-avisos').hidden = !unicos.length;
     $('#avisos').innerHTML = unicos.map((a) => `<li>${esc(a)}</li>`).join('');
@@ -666,6 +670,186 @@
     const el = $('#erro-simbolo');
     el.textContent = msg;
     el.hidden = false;
+  }
+
+  // ------------------------------------------------------------------ conta, limites e posições
+  const RISCO_MS = 2000;
+  let riscoTimer = null;
+  let ultimoRisco = null;
+  const cacheNumero = new Map();
+  function formato(opcoes) {
+    const chave = JSON.stringify(opcoes);
+    if (!cacheNumero.has(chave)) cacheNumero.set(chave, new Intl.NumberFormat('pt-BR', opcoes));
+    return cacheNumero.get(chave);
+  }
+  function dinheiro(valor, moeda, { sinal = false } = {}) {
+    if (valor == null) return '-';
+    return formato({ style: 'currency', currency: moeda || 'USD', minimumFractionDigits: 2, maximumFractionDigits: 2,
+      signDisplay: sinal ? 'exceptZero' : 'auto' }).format(valor);
+  }
+  function numero(valor, casas = 2, sinal = false) {
+    if (valor == null) return '-';
+    return formato({ minimumFractionDigits: casas, maximumFractionDigits: casas, signDisplay: sinal ? 'exceptZero' : 'auto' })
+      .format(valor);
+  }
+  const pctRegra = (v) => `${numero(v, 2).replace(/,00$/, '')}%`;
+  const classeResultado = (v) => (v > 0 ? 'ganho' : v < 0 ? 'perda' : '');
+  // Casas decimais do preço como o servidor mandou (já arredondado pelos dígitos do símbolo).
+  const casasDe = (v) => { const t = String(v); return t.includes('.') ? t.split('.')[1].length : 0; };
+  // O servidor já manda o tipo em português ("compra limitada", "venda stop"…).
+  const nomeOrdem = (tipo) => (tipo ? tipo.charAt(0).toUpperCase() + tipo.slice(1) : 'Ordem');
+
+  async function carregarRisco() {
+    clearTimeout(riscoTimer);
+    if (!document.hidden) {
+      try {
+        const d = await api('/api/risco');
+        ultimoRisco = d;
+        renderConta(d.limites);
+        renderPosicoes(d.posicoes, d.limites.conta.moeda);
+        desenharPosicoes();
+        avisos();
+      } catch (e) {
+        $('#kpi-conta').textContent = `Indisponível: ${e.message}`;
+      }
+    }
+    riscoTimer = setTimeout(carregarRisco, RISCO_MS);
+  }
+
+  function renderConta(l) {
+    const c = l.conta;
+    const alerta = $('#alerta-conta');
+    alerta.hidden = c.is_demo;
+    alerta.textContent = c.is_demo ? '' : `ATENÇÃO: a conta conectada NÃO é demo (${c.tipo_conta}). Confira o MT5_PATH no .env.`;
+    $('#kpi-conta').innerHTML = `${c.is_demo ? 'Demo' : esc(c.tipo_conta)} <span class="num" translate="no">${esc(c.login)}</span>` +
+      (c.conectado ? '' : ' <span class="status" data-nivel="atencao"><span class="ponto"></span>sem conexão</span>');
+    $('#kpi-saldo').innerHTML = dinheiro(c.saldo, c.moeda) +
+      (Math.abs(c.equity - c.saldo) >= 0.01 ? `<small>patrimônio ${dinheiro(c.equity, c.moeda)}</small>` : '');
+    const aberto = l.exposicao_aberta.lucro_aberto;
+    const pos = l.exposicao_aberta.posicoes || 0;
+    $('#kpi-aberto').innerHTML = `<span class="${classeResultado(aberto)}">${dinheiro(aberto, c.moeda, { sinal: true })}</span>` +
+      `<small>${pos === 1 ? '1 posição' : `${pos} posições`}</small>`;
+    $('#regra-dia').textContent = pctRegra(l.regras.dia_pct);
+    $('#regra-semana').textContent = pctRegra(l.regras.semana_pct);
+    $('#medidor-dia').innerHTML = medidor(l.dia, c.moeda);
+    $('#medidor-semana').innerHTML = medidor(l.semana, c.moeda);
+    const p = l.proxima_operacao;
+    const limitador = { por_operacao: `limite de ${pctRegra(p.limite_por_operacao_pct)}`, dia: 'limitado pelo dia', semana: 'limitado pela semana' };
+    $('#kpi-proxima').innerHTML = p.pode_operar
+      ? `até ${dinheiro(p.risco_maximo, c.moeda)}<small>${limitador[p.limitado_por] || ''}</small>`
+      : '<span class="status" data-nivel="limite"><span class="ponto"></span>Sem espaço</span>';
+    $('#kpi-proxima').title = p.motivo || '';
+  }
+
+  // Medidor de um período: perda realizada, perda comprometida nos stops e o que sobra, sobre o limite (mais o
+  // ganho do período, que amplia o espaço). Cor e texto andam juntos: o status nunca depende só da cor.
+  function medidor(per, moeda) {
+    if (per.disponivel == null) {
+      return '<div class="medidor" aria-hidden="true"></div><div class="medidor-texto">' +
+        '<span class="status" data-nivel="atencao"><span class="ponto"></span>Indeterminado</span>' +
+        `<span title="${esc(per.motivo || '')}">${per.motivo ? 'veja o motivo' : ''}</span></div>`;
+    }
+    const realizado = Math.max(0, -per.resultado);
+    const ganho = Math.max(0, per.resultado);
+    const capacidade = per.limite + ganho;
+    const nosStops = Math.max(0, per.limite + per.resultado - per.disponivel);
+    const usado = realizado + nosStops;
+    const fracao = (v) => `${capacidade > 0 ? Math.max(0, Math.min(100, (v / capacidade) * 100)) : 100}%`;
+    const usadoPct = capacidade > 0 ? usado / capacidade : 1;
+    const nivel = per.situacao !== 'ok' ? 'limite' : usadoPct >= 0.5 ? 'atencao' : 'ok';
+    const rotuloNivel = { ok: 'Livre', atencao: 'Atenção', limite: per.situacao === 'limite_atingido' ? 'Limite atingido' : 'Comprometido' }[nivel];
+    const resumo = `Usado ${dinheiro(usado, moeda)} de ${dinheiro(capacidade, moeda)}: realizado ${dinheiro(realizado, moeda)}, ` +
+      `nos stops ${dinheiro(nosStops, moeda)}${ganho ? `, ganho do período ${dinheiro(ganho, moeda)}` : ''}.`;
+    return `<div class="medidor" role="meter" aria-valuemin="0" aria-valuemax="${capacidade.toFixed(2)}" ` +
+      `aria-valuenow="${usado.toFixed(2)}" aria-label="${esc(resumo)}" title="${esc(resumo)}">` +
+      `<span class="realizado" style="width:${fracao(realizado)}"></span><span class="stops" style="width:${fracao(nosStops)}"></span></div>` +
+      `<div class="medidor-texto"><span class="status" data-nivel="${nivel}"><span class="ponto"></span>${rotuloNivel}</span>` +
+      `<span>livre <span class="num">${dinheiro(per.disponivel, moeda)}</span></span></div>`;
+  }
+
+  function renderPosicoes(r, moeda) {
+    const atual = estado.grafico && estado.grafico.simbolo;
+    const botao = (simbolo, corpo) => `<button type="button" class="posicao${simbolo === atual ? ' atual' : ''}" ` +
+      `data-simbolo="${esc(simbolo)}" title="Abrir ${esc(simbolo)} no gráfico">${corpo}</button>`;
+    const itens = [];
+    for (const p of r.posicoes) {
+      if (p.erro) { itens.push(`<p class="sutil">${esc(p.simbolo)}: ${esc(p.erro)}</p>`); continue; }
+      const casas = casasDe(p.preco_abertura);
+      const st = p.stop, al = p.alvo;
+      const stop = st.preco == null ? '<b>sem stop</b>'
+        : `stop <b>${numero(st.preco, casas)}</b> ${dinheiro(st.resultado_se_atingido, moeda, { sinal: true })}` +
+          (st.situacao === 'lucro_protegido' ? ' (lucro protegido)' : '');
+      const alvo = al.preco == null ? ''
+        : `, alvo <b>${numero(al.preco, casas)}</b> ${dinheiro(al.resultado_se_atingido, moeda, { sinal: true })}`;
+      itens.push(botao(p.simbolo,
+        `<span><span class="sim" translate="no">${esc(p.simbolo)}</span>` +
+        `<span class="etiqueta ${p.direcao}">${p.direcao === 'compra' ? 'Compra' : 'Venda'} ${numero(p.volume, 2)}</span></span>` +
+        `<span class="pl ${classeResultado(p.lucro_aberto)}">${dinheiro(p.lucro_aberto, moeda, { sinal: true })}</span>` +
+        `<span class="det">entrada <b>${numero(p.preco_abertura, casas)}</b>, agora <b>${numero(p.preco_atual, casas)}</b>, há ${esc(p.aberta_ha)}</span>` +
+        `<span class="det">${stop}${alvo}</span>` +
+        (st.preco == null ? '<span class="alerta">Sem stop: a perda não tem limite e os limites do dia e da semana ficam indeterminados.</span>' : '') +
+        (p.cotacao && p.cotacao.estado !== 'atual' ? `<span class="alerta">Cotação ${esc(p.cotacao.estado.replace(/_/g, ' '))}: valores não são de agora.</span>` : '')));
+    }
+    for (const o of r.pendentes || []) {
+      if (o.erro) { itens.push(`<p class="sutil">${esc(o.simbolo)}: ${esc(o.erro)}</p>`); continue; }
+      const casas = casasDe(o.preco_ativacao);
+      const st = o.stop || {};
+      itens.push(botao(o.simbolo,
+        `<span><span class="sim" translate="no">${esc(o.simbolo)}</span>` +
+        `<span class="etiqueta pendente">${esc(nomeOrdem(o.tipo))} ${numero(o.volume, 2)}</span></span>` +
+        '<span class="pl sutil">pendente</span>' +
+        `<span class="det">ativa em <b>${numero(o.preco_ativacao, casas)}</b>` +
+        (st.preco != null
+          ? `, stop <b>${numero(st.preco, casas)}</b> ${dinheiro(st.resultado_se_executada_e_atingido, moeda, { sinal: true })}`
+          : ', <b>sem stop</b>') + '</span>'));
+    }
+    const n = r.posicoes.length, m = (r.pendentes || []).length;
+    $('#contagem-posicoes').textContent = n || m ? `${n} aberta${n === 1 ? '' : 's'}, ${m} pendente${m === 1 ? '' : 's'}` : '';
+    $('#posicoes').innerHTML = itens.join('') || '<p class="sutil">Nenhuma posição aberta nem ordem pendente.</p>';
+  }
+  $('#posicoes').addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-simbolo]');
+    if (b && b.dataset.simbolo !== (estado.grafico && estado.grafico.simbolo)) trocar({ simbolo: b.dataset.simbolo });
+  });
+
+  // Entrada, stop e alvo das posições e ordens do símbolo do gráfico, como linhas de preço.
+  let linhasPosicoes = [];
+  let assinaturaPosicoes = '';
+  function desenharPosicoes() {
+    const d = estado.grafico;
+    const r = ultimoRisco && ultimoRisco.posicoes;
+    const linhas = [];
+    if (d && r && estado.camadas.posicoes) {
+      for (const p of r.posicoes) {
+        if (p.erro || p.simbolo !== d.simbolo) continue;
+        linhas.push({ price: p.preco_abertura, color: COR.texto2, lineStyle: LW.LineStyle.Solid,
+          title: `${p.direcao === 'compra' ? 'Compra' : 'Venda'} ${numero(p.volume, 2)}` });
+        if (p.stop.preco != null) {
+          linhas.push({ price: p.stop.preco, color: COR.baixa, lineStyle: LW.LineStyle.Dashed,
+            title: `Stop ${numero(p.stop.resultado_se_atingido, 2, true)}` });
+        }
+        if (p.alvo.preco != null) {
+          linhas.push({ price: p.alvo.preco, color: COR.alta, lineStyle: LW.LineStyle.Dashed,
+            title: `Alvo ${numero(p.alvo.resultado_se_atingido, 2, true)}` });
+        }
+      }
+      for (const o of r.pendentes || []) {
+        if (o.erro || o.simbolo !== d.simbolo || o.preco_ativacao == null) continue;
+        linhas.push({ price: o.preco_ativacao, color: COR.texto2, lineStyle: LW.LineStyle.Dotted,
+          title: `${nomeOrdem(o.tipo)} ${numero(o.volume, 2)}` });
+        if (o.stop && o.stop.preco != null) {
+          linhas.push({ price: o.stop.preco, color: alpha(COR.baixa, 0.7), lineStyle: LW.LineStyle.Dotted, title: 'Stop da ordem' });
+        }
+        if (o.alvo && o.alvo.preco != null) {
+          linhas.push({ price: o.alvo.preco, color: alpha(COR.alta, 0.7), lineStyle: LW.LineStyle.Dotted, title: 'Alvo da ordem' });
+        }
+      }
+    }
+    const assinatura = JSON.stringify(linhas);
+    if (assinatura === assinaturaPosicoes) return;  // nada mudou: não recria as linhas a cada 2 s
+    assinaturaPosicoes = assinatura;
+    for (const l of linhasPosicoes) velas.removePriceLine(l);
+    linhasPosicoes = linhas.map((l) => velas.createPriceLine({ ...l, lineWidth: 1, axisLabelVisible: true }));
   }
 
   // ------------------------------------------------------------------ controles
@@ -732,6 +916,7 @@
     montarCamadas();
     camadaSmc.atualizar(estado.grafico);
     desenharNiveis();
+    desenharPosicoes();
   });
   $('#form-simbolo').addEventListener('submit', (e) => {
     e.preventDefault();
@@ -747,7 +932,9 @@
     const n = Number(e.key);
     if (n >= 1 && n <= TIMEFRAMES.length && TIMEFRAMES[n - 1] !== estado.tf) trocar({ tf: TIMEFRAMES[n - 1] });
   });
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) { aoVivo(); carregarGrafico({ manterVista: true }); } });
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) { aoVivo(); carregarRisco(); carregarGrafico({ manterVista: true }); }
+  });
 
   // ------------------------------------------------------------------ início
   (async () => {
@@ -757,6 +944,7 @@
       const cfg = await api('/api/config');
       $('#lista-simbolos').innerHTML = cfg.instrumentos.map((s) => `<option value="${esc(s)}"></option>`).join('');
     } catch { /* sem a lista, o campo continua aceitando qualquer símbolo */ }
+    carregarRisco();  // antes da estrutura, que é lenta e disputa a mesma conexão com o MT5
     trocar();
   })();
 })();

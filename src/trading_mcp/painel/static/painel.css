@@ -46,7 +46,7 @@ html, body { margin: 0; }
 body {
   min-height: 100dvh;
   display: grid;
-  grid-template-rows: auto 1fr auto;
+  grid-template-rows: auto auto 1fr auto;
   background: var(--bg);
   color: var(--text);
   font: 14px/1.45 var(--font);
@@ -121,6 +121,56 @@ button { cursor: pointer; -webkit-tap-highlight-color: transparent; }
 .estado[data-estado="atual"] .ponto { background: var(--bull); }
 .estado[data-estado="atrasado"] .ponto, .estado[data-estado="erro"] .ponto { background: var(--warn); }
 #contagem, #spread { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+/* ------------------------------------------------------------------ conta e limites */
+.conta { border-bottom: 1px solid var(--border); background: var(--bg); }
+.alerta-conta {
+  padding: 8px 16px; font-weight: 600;
+  background: rgba(239, 83, 80, 0.14); border-bottom: 1px solid var(--bear);
+}
+.kpis { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 10px 32px; margin: 0; padding: 10px 16px 12px; }
+.kpi { min-width: 0; }
+.kpi dt { margin-bottom: 3px; font-size: 12px; color: var(--text-muted); white-space: nowrap; }
+.kpi dd { margin: 0; font-size: 15px; font-weight: 500; white-space: nowrap; }
+.kpi dd.num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.kpi dd small { margin-left: 6px; font-family: var(--font); font-size: 12px; font-weight: 400; color: var(--text-muted); }
+.ganho { color: var(--bull); }
+.perda { color: var(--bear); }
+
+.medidor-kpi { flex: 1 1 240px; max-width: 340px; }
+.medidor-kpi dd { white-space: normal; }
+.medidor { display: flex; height: 6px; margin: 7px 0 5px; border-radius: 3px; overflow: hidden; background: var(--surface-3); }
+.medidor span { height: 100%; }
+.medidor .realizado { background: var(--bear); }
+.medidor .stops { background: repeating-linear-gradient(135deg, rgba(239, 83, 80, 0.8) 0 3px, rgba(239, 83, 80, 0.3) 3px 6px); }
+.medidor-texto { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--text-2); }
+.medidor-texto .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.status { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 500; }
+.status .ponto { width: 7px; height: 7px; border-radius: 50%; background: var(--text-muted); }
+.status[data-nivel="ok"] .ponto { background: var(--bull); }
+.status[data-nivel="atencao"] { color: var(--warn); }
+.status[data-nivel="atencao"] .ponto { background: var(--warn); }
+.status[data-nivel="limite"] { color: var(--bear); }
+.status[data-nivel="limite"] .ponto { background: var(--bear); }
+
+/* ------------------------------------------------------------------ posições */
+.posicao {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 3px 12px; align-items: baseline;
+  width: calc(100% + 16px); margin: 0 -8px; padding: 8px; text-align: left;
+  background: transparent; border: 0; border-radius: var(--radius);
+  transition: background-color 150ms var(--ease);
+}
+.posicao:hover { background: var(--surface-2); }
+.posicao.atual { box-shadow: inset 2px 0 0 var(--accent); }
+.posicao .sim { font-family: var(--mono); font-weight: 600; }
+.etiqueta { margin-left: 6px; padding: 1px 6px; border-radius: 4px; font-size: 11.5px; font-weight: 500; }
+.etiqueta.compra { color: var(--bull); background: rgba(38, 166, 154, 0.14); }
+.etiqueta.venda { color: var(--bear); background: rgba(239, 83, 80, 0.14); }
+.etiqueta.pendente { color: var(--text-2); background: var(--surface-3); }
+.posicao .pl { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; }
+.posicao .det { grid-column: 1 / -1; font-size: 12px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.posicao .det b { font-weight: 500; color: var(--text-2); }
+.posicao .alerta { grid-column: 1 / -1; font-size: 12px; color: var(--warn); }
 
 /* ------------------------------------------------------------------ área principal */
 .area {
@@ -271,6 +321,8 @@ button { cursor: pointer; -webkit-tap-highlight-color: transparent; }
   .camadas { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; min-width: 0; }
   .camadas button { flex: none; }
   .legenda { font-size: 11px; max-width: calc(100% - 84px); }
+  .kpis { gap: 10px 20px; padding: 10px 12px; }
+  .medidor-kpi { flex-basis: 100%; max-width: none; }
 }
 
 @media (prefers-reduced-motion: reduce) {
