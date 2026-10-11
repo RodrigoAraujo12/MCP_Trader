@@ -26,7 +26,7 @@ from trading_mcp.config import Settings, load_settings
 from trading_mcp.journal import Journal, JournalError
 from trading_mcp.execucao import ExecucaoError
 from trading_mcp.limites import LimitesError, ProposalStore, RiskRules
-from trading_mcp.mt5_client import MT5Client, MT5Error
+from trading_mcp.mt5_client import MT5Client, MT5Error, candle_warnings
 from trading_mcp.reacoes import ReacoesError, ReactionStore
 from trading_mcp.sec_edgar import SecEdgarClient, SecEdgarError
 
@@ -149,27 +149,6 @@ def _round(value: float, digits: int) -> float:
     return round(float(value), digits)
 
 
-def _candle_warnings(df: Any) -> list[str]:
-    """Avisos sobre a confiabilidade dos candles devolvidos por MT5Client.rates."""
-    warnings: list[str] = []
-    if not df.attrs.get("conectado", True):
-        warnings.append(
-            "Terminal sem conexão com a corretora: os candles mais recentes podem estar faltando e o "
-            "último pode não ser atualizado."
-        )
-    if df.attrs.get("horario_inconsistente"):
-        warnings.append(
-            "O último candle abre depois do horário UTC atual: o servidor pode não usar UTC ou o relógio "
-            "do Windows está errado. Não use os horários sem conferir."
-        )
-    if df.attrs.get("defasado"):
-        warnings.append(
-            "Faltam os candles mais recentes: o terminal ainda está sincronizando o histórico deste ativo e o "
-            "último candle termina antes da última cotação. Repita o pedido em alguns segundos."
-        )
-    return warnings
-
-
 def create_server(
     settings: Settings | None = None,
     mt5_client: MT5Client | None = None,
@@ -260,7 +239,7 @@ def create_server(
                 },
                 "candles_csv": "\n".join(lines),
             }
-            warnings = _candle_warnings(df)
+            warnings = candle_warnings(df)
             if warnings:
                 result["avisos"] = warnings
             return result
@@ -298,7 +277,7 @@ def create_server(
             forming = df.attrs["ultimo_em_formacao"]
             if forming:
                 notes.append("O último candle ainda está em formação: os valores mudam até ele fechar.")
-            notes += _candle_warnings(df)
+            notes += candle_warnings(df)
             return {
                 "simbolo": resolved,
                 "timeframe": timeframe.upper(),

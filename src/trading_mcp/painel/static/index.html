@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0c0d10">
+  <title>Painel MCP Trader</title>
+  <link rel="preload" href="/static/vendor/geist-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="/static/vendor/geist-mono-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/static/painel.css">
+</head>
+<body>
+  <a class="skip" href="#lateral">Pular para a leitura da estrutura</a>
+
+  <header class="topo">
+    <div class="marca" translate="no">MCP Trader</div>
+
+    <form class="simbolo" id="form-simbolo" autocomplete="off">
+      <label for="campo-simbolo" class="sr">Símbolo</label>
+      <input id="campo-simbolo" name="simbolo" list="lista-simbolos" spellcheck="false" autocapitalize="characters"
+             placeholder="Símbolo, ex.: USTEC…" translate="no">
+      <datalist id="lista-simbolos"></datalist>
+      <p class="erro-campo" id="erro-simbolo" role="alert" hidden></p>
+    </form>
+
+    <div class="segmentos" id="timeframes" role="group" aria-label="Timeframe do gráfico"></div>
+
+    <div class="cotacao" aria-live="polite">
+      <div class="preco" id="preco" translate="no">-</div>
+      <div class="detalhes">
+        <span class="estado" id="estado"><span class="ponto" aria-hidden="true"></span><span id="estado-texto">Conectando…</span></span>
+        <span id="spread" class="sutil"></span>
+        <span id="contagem" class="sutil"></span>
+      </div>
+    </div>
+  </header>
+
+  <main class="area">
+    <section class="grafico-bloco" aria-labelledby="titulo-grafico">
+      <div class="barra-grafico">
+        <h1 id="titulo-grafico" class="sr">Gráfico</h1>
+        <div class="camadas" id="camadas" role="group" aria-label="Camadas do gráfico"></div>
+        <div class="segmentos pequeno" id="fusos" role="group" aria-label="Fuso dos horários"></div>
+      </div>
+      <div class="grafico-moldura">
+        <div id="grafico" class="grafico" role="img" aria-label="Gráfico de candles com a estrutura SMC"></div>
+        <div class="legenda" id="legenda" translate="no"></div>
+        <div class="sobreposicao" id="carregando">
+          <div class="esqueleto"></div>
+        </div>
+        <div class="sobreposicao erro" id="erro-grafico" hidden>
+          <p id="erro-grafico-texto"></p>
+          <button type="button" class="botao" id="tentar-de-novo">Tentar de novo</button>
+        </div>
+      </div>
+    </section>
+
+    <aside class="lateral" id="lateral" tabindex="-1" aria-label="Leitura da estrutura">
+      <section class="secao">
+        <h2>Estrutura <span class="sutil">por fechamento</span></h2>
+        <table class="tabela" id="tabela-estrutura">
+          <thead><tr><th scope="col">TF</th><th scope="col">Micro</th><th scope="col">Macro</th></tr></thead>
+          <tbody><tr><td colspan="3" class="sutil">Carregando…</td></tr></tbody>
+        </table>
+        <p class="nota" id="nota-pavio" hidden></p>
+      </section>
+
+      <section class="secao">
+        <h2>Faixa macro <span class="sutil" id="faixa-tf"></span></h2>
+        <div id="faixa" class="faixa"><p class="sutil">Carregando…</p></div>
+      </section>
+
+      <section class="secao">
+        <h2>Alvos de liquidez</h2>
+        <p class="nota">Onde o preço costuma reagir, não previsão. Passe o mouse para ver no gráfico.</p>
+        <ol class="escada" id="alvos"><li class="sutil">Carregando…</li></ol>
+      </section>
+
+      <section class="secao">
+        <h2>Sessões de hoje</h2>
+        <div id="sessoes"><p class="sutil">Carregando…</p></div>
+      </section>
+
+      <section class="secao">
+        <h2>Dia e semana</h2>
+        <div id="dia-semana"><p class="sutil">Carregando…</p></div>
+      </section>
+
+      <section class="secao" id="secao-avisos" hidden>
+        <h2>Avisos</h2>
+        <ul class="avisos" id="avisos"></ul>
+      </section>
+    </aside>
+  </main>
+
+  <footer class="rodape">
+    <span id="atualizado" class="sutil">Sem dados ainda</span>
+    <span class="sutil">Medição, não sinal. A decisão de entrar é sua.</span>
+  </footer>
+
+  <script src="/static/vendor/lightweight-charts.standalone.production.js"></script>
+  <script src="/static/painel.js"></script>
+</body>
+</html>

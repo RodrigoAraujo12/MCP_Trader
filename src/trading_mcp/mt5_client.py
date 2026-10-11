@@ -172,6 +172,27 @@ def _guard(func: Callable[..., Any]) -> Callable[..., Any]:
     return wrapper
 
 
+def candle_warnings(df: pd.DataFrame) -> list[str]:
+    """Avisos sobre a confiabilidade dos candles devolvidos por MT5Client.rates."""
+    warnings: list[str] = []
+    if not df.attrs.get("conectado", True):
+        warnings.append(
+            "Terminal sem conexão com a corretora: os candles mais recentes podem estar faltando e o "
+            "último pode não ser atualizado."
+        )
+    if df.attrs.get("horario_inconsistente"):
+        warnings.append(
+            "O último candle abre depois do horário UTC atual: o servidor pode não usar UTC ou o relógio "
+            "do Windows está errado. Não use os horários sem conferir."
+        )
+    if df.attrs.get("defasado"):
+        warnings.append(
+            "Faltam os candles mais recentes: o terminal ainda está sincronizando o histórico deste ativo e o "
+            "último candle termina antes da última cotação. Repita o pedido em alguns segundos."
+        )
+    return warnings
+
+
 class MT5Client:
     """Acesso de leitura ao MT5; toda chamada ao módulo é serializada por um RLock."""
 

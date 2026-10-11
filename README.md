@@ -20,7 +20,7 @@ Onde conversar com o Claude:
 - **Claude Code** (terminal ou extensão do VS Code): mesmo funcionamento, num painel do editor. Mais prático quando você também está mexendo no código.
 - **MCP Inspector**: página web para chamar cada ferramenta manualmente, preenchendo os campos. Serve para testar e depurar, não para uso diário.
 
-Uma tela própria (gráficos interativos, calculadora com formulário) está no roadmap como opcional. Veja a seção [Roadmap](#roadmap).
+Para olhar o mercado sem conversar, há também o [painel no navegador](#painel-no-navegador): gráfico ao vivo com a estrutura SMC desenhada.
 
 ## Requisitos
 
@@ -281,6 +281,25 @@ claude mcp list
 npx @modelcontextprotocol/inspector "C:\caminho\para\MCP_Trader\.venv\Scripts\python.exe" -m trading_mcp
 ```
 
+## Painel no navegador
+
+Gráfico de candles ao vivo com a estrutura SMC desenhada pelas mesmas regras de `estrutura_smc`, e a leitura do servidor ao lado. Roda separado do Claude: o Claude Desktop pode estar aberto ou fechado, e os dois leem o mesmo terminal MT5.
+
+Para abrir, dê dois cliques em `scripts\iniciar_painel.bat` (ou rode o comando abaixo) com o MetaTrader 5 aberto. O navegador abre em `http://127.0.0.1:8765`; feche a janela do prompt para parar.
+
+```powershell
+.\.venv\Scripts\python.exe -m trading_mcp.painel
+```
+
+- **No gráfico**: order blocks ativos (caixa cheia) e FVGs abertos (caixa tracejada), BOS/CHoCH por fechamento ligados ao topo/fundo rompido (macro em linha cheia, micro tracejada), HH/HL/LH/LL dos topos e fundos macro, topos/fundos iguais (EQH/EQL) e varreduras ("sweep"), caixas das sessões Ásia, Londres e Nova York e as linhas PDH/PDL (dia anterior), PWH/PWL (semana anterior) e topos/fundos diários intactos. Verde = de alta, vermelho = de baixa, amarelo = liquidez. Cada camada liga e desliga nos botões acima do gráfico.
+- **Ao lado**: tendência micro e macro por timeframe (H4 a M5, com aviso quando a leitura por pavio diverge), posição na faixa macro (premium/discount), alvos de liquidez acima e abaixo do preço (passe o mouse para destacar no gráfico), máximas e mínimas das sessões, do dia e da semana com o que já foi varrido ou rompido.
+- **Controles**: símbolo (qualquer um da conta; os do `INSTRUMENTOS` aparecem na lista), timeframe (M1 a D1, ou as teclas 1 a 8) e fuso dos horários (São Paulo, Nova York ou UTC). Símbolo, timeframe e fuso ficam no endereço da página, então dá para salvar nos favoritos.
+- **Atualização**: preço e último candle a cada segundo; a estrutura do gráfico é recalculada quando um candle fecha, e a barra lateral a cada minuto.
+
+O painel **só lê**: não envia, altera nem cancela ordens, e não grava no journal. Enviar ordem continua só pelo chat, com a aprovação na janela do Windows, porque um botão numa página local poderia ser acionado por qualquer programa do PC. Ele escuta apenas em `127.0.0.1` e recusa pedidos com outro endereço (proteção contra *DNS rebinding*), então os dados da conta não ficam visíveis na rede.
+
+Como no resto do projeto, é medição, não sinal. Gráficos: [TradingView Lightweight Charts](https://www.tradingview.com/lightweight-charts/) (Apache 2.0); fonte Geist (SIL OFL). As cópias ficam em `painel/static/vendor/`, então o painel funciona sem internet.
+
 ## Testes
 
 Os testes usam um MT5 simulado; não precisam do terminal:
@@ -309,7 +328,11 @@ src/trading_mcp/
 ├── limites.py         # Limites de risco do usuário e propostas de operação
 ├── execucao.py        # Execução de propostas na conta demo (travas, janela, order_check/order_send)
 ├── aprovacao.py       # Janela de aprovação do Windows (o clique do usuário libera a ordem)
-└── sec_edgar.py       # Fundamentos da SEC EDGAR
+├── sec_edgar.py       # Fundamentos da SEC EDGAR
+└── painel/            # Painel no navegador (só leitura)
+    ├── app.py         # API local (Starlette) e página
+    ├── graficos.py    # Candles e desenhos SMC para o gráfico (regras do smc.py)
+    └── static/        # Página, estilos, script e cópias do Lightweight Charts e da fonte Geist
 
 tests/
 ├── fake_mt5.py        # Simulador do módulo MetaTrader5
@@ -350,4 +373,4 @@ Revisado em 2026-10-02.
 - **D**: o SMC do usuário é discricionário (sem setup fixo), então a etapa virou ferramentas de estrutura (D1: `estrutura_smc`, feito) e o contexto SMC de cada operação no journal (D2, feito: sessão, estrutura, CHoCH, varredura, OB/FVG, premium/discount, medidos sozinhos na hora da entrada, mais as tags do usuário) para medir quais combinações funcionam. Backtest só de uma variante que os dados indicarem.
 - **E**: painel dos limites do usuário (1,25% / 5% / 25% sobre o saldo do início do dia e da semana de mercado) e propostas de operação guardadas com validade e assinatura, sem envio (feito). A aprovação fora do chat entra com a execução, na F.
 - **F**: execução **somente em conta demo**, com aprovação do usuário numa janela do Windows, verificação de conta, preço e limites imediatamente antes do envio, reconciliação e kill switch (feito; primeiro teste real com o mercado aberto).
-- **G**: coleta contínua, alertas ou dashboard, só se o uso justificar.
+- **G**: painel no navegador, só leitura (G1, feito: gráfico ao vivo com a estrutura SMC e a leitura ao lado). Próximos: risco e posições no painel, estatísticas do journal em gráficos e alertas de preço.
