@@ -465,8 +465,10 @@ class FakeMT5:
         if date_from.tzinfo is None or date_to.tzinfo is None:
             raise AssertionError("copy_ticks_range recebeu datetime sem fuso")
         data = self.ticks.get(symbol, np.array([], dtype=TICK_DTYPE))
-        lo, hi = int(date_from.timestamp() * 1000), int(date_to.timestamp() * 1000)
-        return data[(data["time_msc"] >= lo) & (data["time_msc"] <= hi)].copy()
+        # Como no terminal real (conferido em 2026-10-12): as pontas viram segundos inteiros e o fim é exclusivo;
+        # uma janela menor que um segundo, dentro do mesmo segundo, volta vazia.
+        lo, hi = int(date_from.timestamp()) * 1000, int(date_to.timestamp()) * 1000
+        return data[(data["time_msc"] >= lo) & (data["time_msc"] < hi)].copy()
 
     def history_deals_get(self, date_from: Any = None, date_to: Any = None, *, position: int | None = None, **kwargs: Any):
         if not self.initialized:

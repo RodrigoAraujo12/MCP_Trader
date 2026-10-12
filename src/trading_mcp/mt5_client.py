@@ -643,6 +643,14 @@ class MT5Client:
                 result["aviso"] = aviso
             return result
 
+    @_guard
+    def last_tick(self, symbol: str) -> tuple[datetime, float] | None:
+        """Horário (UTC, do servidor) e bid do último tick, sem a análise de atraso da ``quote``; None sem tick."""
+        with self._lock:
+            resolved = self.resolve_symbol(symbol)
+            tick = self._call("symbol_info_tick", resolved)
+        return (self._tick_time(tick), float(tick.bid)) if self._tick_valid(tick) else None
+
     def _bars_limit(self) -> int:
         """Máximo de candles por chamada: MAX_BARS e o limite do terminal (pedir maxbars falha)."""
         limit = self._settings.max_bars
@@ -734,10 +742,12 @@ class MT5Client:
         return start.astimezone(timezone.utc), end.astimezone(timezone.utc)
 
     @_guard
-    def rates_between(self, symbol: str, timeframe: str, start: datetime, end: datetime) -> pd.DataFrame:
+    def rates_between(self, symbol: str, timeframe: str, start: datetime, end: datetime, *,
+                      attempts: int = _RATES_ATTEMPTS) -> pd.DataFrame:
         """Candles com abertura entre ``start`` e ``end`` (UTC), do mais antigo ao mais novo; pode vir vazio.
 
-        Os candles do MT5 são de bid. ``df.attrs["conectado"]`` informa a conexão com a corretora.
+        Os candles do MT5 são de bid. ``df.attrs["conectado"]`` informa a conexão com a corretora. Vazio no passado
+        repete até ``attempts`` vezes, esperando com o MT5 travado; quem chama a cada segundo passa 1.
         """
         tf_key = (timeframe or "").strip().upper()
         if tf_key not in TIMEFRAMES:
@@ -747,7 +757,7 @@ class MT5Client:
             resolved = self.resolve_symbol(symbol)
             tf = getattr(self._module(), TIMEFRAMES[tf_key])
             past = end < self._now_utc() - timedelta(minutes=1)
-            for attempt in range(_RATES_ATTEMPTS):
+            for attempt in range(max(1, attempts)):
                 if attempt:
                     self._sleep(_RATES_RETRY_S)
                 data = self._call("copy_rates_range", resolved, tf, start, end)

@@ -1,5 +1,5 @@
 /* Painel MCP Trader: gráfico (Lightweight Charts) com a estrutura SMC desenhada e a leitura do servidor ao lado.
-   Só lê a API local; nada aqui envia ordens. */
+   Lê a API local e só grava alertas de preço; nada aqui envia ordens. */
 (() => {
   'use strict';
 
@@ -30,9 +30,14 @@
     { id: 'liquidez', rotulo: 'Liquidez', amostra: `height:0;border-top:2px dotted ${COR.liq}` },
     { id: 'niveis', rotulo: 'Dia e semana', amostra: `height:0;border-top:2px dashed ${COR.liq}` },
     { id: 'sessoes', rotulo: 'Sessões', amostra: `background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.2)` },
+    { id: 'alertas', rotulo: 'Alertas', amostra: `height:0;border-top:2px dotted ${COR.destaque}` },
   ];
   const ATUALIZA_MS = 1000;
   const ESTRUTURA_MS = 60000;
+  const ALERTAS_MS = 2000;
+  const SINO = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" ' +
+    'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/>' +
+    '<path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>';
 
   // ------------------------------------------------------------------ estado
   const url = new URL(location.href);
@@ -52,6 +57,7 @@
     geracao: 0,
     grafico: null,       // resposta de /api/grafico
     estrutura: null,     // resposta de /api/estrutura
+    alertas: null,       // resposta de /api/alertas
     velas: [],
     digitos: 2,
     ultimoPreco: null,
@@ -442,9 +448,14 @@
       velas.setData(estado.velas);
       camadaSmc.atualizar(d);
       desenharPosicoes();
+      desenharAlertas();
       if (ultimoRisco) renderPosicoes(ultimoRisco.posicoes, ultimoRisco.limites.conta.moeda);
       if (vista) grafico.timeScale().setVisibleLogicalRange(vista);
-      else grafico.timeScale().setVisibleLogicalRange({ from: estado.velas.length - 160, to: estado.velas.length + 12 });
+      else {
+        // Arrastar a escala de preço desliga o ajuste automático; outro símbolo ou timeframe volta a ajustar.
+        velas.priceScale().applyOptions({ autoScale: true });
+        grafico.timeScale().setVisibleLogicalRange({ from: estado.velas.length - 160, to: estado.velas.length + 12 });
+      }
       legenda(estado.velas[estado.velas.length - 1]);
       $('#grafico').setAttribute('aria-label',
         `Gráfico de ${d.simbolo} em ${d.timeframe}: estrutura micro ${d.smc.tendencia.micro}, macro ${d.smc.tendencia.macro}.`);
@@ -626,12 +637,15 @@
     const a = d.alvos;
     const ol = $('#alvos');
     if (!a) { ol.innerHTML = '<li class="vazio">Sem cotação para calcular os alvos.</li>'; return; }
-    const item = (x) => `<li class="alvo" tabindex="0" data-preco="${x.preco}" data-titulo="${esc(x.tipos[0])}">` +
+    const item = (x) => `<li class="alvo" tabindex="0" data-preco="${x.preco}" data-titulo="${esc(x.tipos[0])}" ` +
+      `data-tipos="${esc(x.tipos.join(', '))}">` +
       `<span class="p">${preco(x.preco)}</span><span class="d">${pct(x.distancia_pct)}</span>` +
+      `<button type="button" class="sino" aria-pressed="false" aria-label="Criar alerta em ${preco(x.preco)}">${SINO}</button>` +
       `<span class="t">${x.tipos.map(esc).join(', ')}</span></li>`;
     const acima = a.acima.slice().reverse().map(item).join('') || '<li class="vazio">Nada mapeado acima.</li>';
     const abaixo = a.abaixo.map(item).join('') || '<li class="vazio">Nada mapeado abaixo.</li>';
     ol.innerHTML = acima + `<li class="agora"><span>Preço de referência</span><span class="p num">${preco(a.referencia)}</span></li>` + abaixo;
+    marcarSinos();
   }
   for (const evento of ['mouseover', 'focusin']) {
     $('#alvos').addEventListener(evento, (e) => {
@@ -863,6 +877,159 @@
     assinaturaPosicoes = assinatura;
     for (const l of linhasPosicoes) velas.removePriceLine(l);
     linhasPosicoes = linhas.map((l) => velas.createPriceLine({ ...l, lineWidth: 1, axisLabelVisible: true }));
+  }
+
+  // ------------------------------------------------------------------ alertas
+  // O servidor vigia e avisa no Windows; a página só cria, apaga e mostra. Gravações levam o cabeçalho X-Painel,
+  // sem o qual o servidor recusa (um site de fora não consegue mandá-lo sem a licença CORS, que o painel não dá).
+  let alertasTimer = null;
+  let leituraAlertas = 0;  // só a leitura mais nova vale (uma lenta não sobrescreve a feita depois de um clique)
+  let assinaturaAlertas = '';
+  let disparadosVistos = null;  // ids já disparados na primeira leitura não piscam
+  let erroAlertaTimer = null;
+  async function apiGravar(metodo, caminho, corpo) {
+    const r = await fetch(new URL(caminho, location.origin), {
+      method: metodo, cache: 'no-store',
+      headers: { 'Content-Type': 'application/json', 'X-Painel': '1' },
+      body: corpo === undefined ? undefined : JSON.stringify(corpo),
+    });
+    const resposta = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(resposta.erro || `Erro ${r.status}`);
+    return resposta;
+  }
+  async function carregarAlertas() {
+    clearTimeout(alertasTimer);
+    const leitura = ++leituraAlertas;
+    if (!document.hidden) {
+      try {
+        const d = await api('/api/alertas');
+        if (leitura !== leituraAlertas) return;  // uma leitura mais nova já cuida da tela e do próximo ciclo
+        renderAlertas(d);
+      } catch (e) {
+        if (leitura !== leituraAlertas) return;
+        $('#aviso-vigia').hidden = false;
+        $('#aviso-vigia').textContent = `Alertas indisponíveis: ${e.message}`;
+      }
+    }
+    alertasTimer = setTimeout(carregarAlertas, ALERTAS_MS);
+  }
+  function mostrarErroAlerta(msg) {
+    const el = $('#erro-alerta');
+    el.textContent = msg;
+    el.hidden = false;
+    clearTimeout(erroAlertaTimer);
+    erroAlertaTimer = setTimeout(() => { el.hidden = true; }, 8000);
+  }
+  const simboloDaTela = () => (estado.estrutura && estado.estrutura.simbolo) || (estado.grafico && estado.grafico.simbolo);
+  const ativos = () => ((estado.alertas && estado.alertas.alertas) || []).filter((a) => a.status === 'ativo');
+  function alertaNoNivel(p) {
+    const s = simboloDaTela();
+    return ativos().find((a) => a.simbolo === s && Math.abs(a.preco - p) < 10 ** -a.digitos / 2);
+  }
+  function renderAlertas(d) {
+    estado.alertas = d;
+    const v = d.vigia;
+    const erros = v ? Object.entries(v.erros || {}) : [];
+    const aviso = !v || !v.ativo
+      ? 'Ninguém está vigiando: os alertas só disparam com o painel aberto pelo iniciar_painel.bat.'
+      : erros.length ? `Problema ao vigiar ${erros.map(([k, m]) => `${k}: ${m}`).join('; ')}` : '';
+    $('#aviso-vigia').hidden = !aviso;
+    $('#aviso-vigia').textContent = aviso;
+    marcarSinos();
+    desenharAlertas();
+    const assinatura = JSON.stringify([d.alertas, estado.fuso.id]);
+    if (assinatura === assinaturaAlertas) return;  // nada mudou: não refaz a lista (nem tira o foco) a cada 2 s
+    assinaturaAlertas = assinatura;
+    const disparados = d.alertas.filter((a) => a.status === 'disparado');
+    const novos = new Set(disparadosVistos ? disparados.map((a) => a.id).filter((id) => !disparadosVistos.has(id)) : []);
+    disparadosVistos = new Set(disparados.map((a) => a.id));
+    const n = d.alertas.length - disparados.length, m = disparados.length;
+    $('#contagem-alertas').textContent = n || m ? `${n} ativo${n === 1 ? '' : 's'}${m ? `, ${m} disparado${m === 1 ? '' : 's'}` : ''}` : '';
+    $('#limpar-alertas').hidden = !m;
+    const quando = (a) => {
+      if (a.status === 'ativo') return `${a.lado === 'acima' ? 'Acima' : 'Abaixo'} do preço (${numero(a.preco_criacao, a.digitos)} na criação)`;
+      const t = dataHora(Date.parse(a.disparado.utc) / 1000);
+      return a.disparo_por === 'candle_m1'
+        ? `Tocou no candle M1 de ${t}, com o painel fechado`
+        : `Tocou em ${t}, bid ${numero(a.preco_disparo, a.digitos)}`;
+    };
+    $('#alertas').innerHTML = d.alertas.map((a) =>
+      `<li class="alerta-item ${a.status}${novos.has(a.id) ? ' novo' : ''}">` +
+      `<button type="button" class="ir" data-simbolo="${esc(a.simbolo)}" title="Abrir ${esc(a.simbolo)} no gráfico">` +
+      `<span class="sim" translate="no">${esc(a.simbolo)}</span><span class="p">${numero(a.preco, a.digitos)}</span>` +
+      `<span class="t">${esc(a.titulo)}</span><span class="quando">${esc(quando(a))}</span></button>` +
+      `<button type="button" class="remover" data-id="${a.id}" aria-label="Remover alerta de ${esc(a.simbolo)} em ${numero(a.preco, a.digitos)}">` +
+      '<span aria-hidden="true">×</span></button></li>').join('') ||
+      '<li class="sutil">Nenhum alerta. Use o sino de um alvo de liquidez.</li>';
+  }
+  // Sinos dos alvos: preenchidos onde já há alerta ativo no símbolo da tela.
+  function marcarSinos() {
+    for (const b of document.querySelectorAll('#alvos button.sino')) {
+      const li = b.closest('li.alvo');
+      const tem = !!alertaNoNivel(Number(li.dataset.preco));
+      b.setAttribute('aria-pressed', String(tem));
+      b.setAttribute('aria-label', `${tem ? 'Remover alerta de' : 'Criar alerta em'} ${preco(Number(li.dataset.preco))}`);
+      b.title = tem ? 'Remover o alerta deste nível' : 'Avisar quando o preço tocar este nível';
+    }
+  }
+  $('#alvos').addEventListener('click', async (e) => {
+    const b = e.target.closest('button.sino');
+    if (!b || b.disabled) return;
+    const li = b.closest('li.alvo');
+    const nivel = Number(li.dataset.preco);
+    const existente = alertaNoNivel(nivel);
+    b.disabled = true;
+    try {
+      if (existente) await apiGravar('DELETE', `/api/alertas/${existente.id}`);
+      else await apiGravar('POST', '/api/alertas', { simbolo: simboloDaTela(), preco: nivel, titulo: li.dataset.tipos });
+      $('#erro-alerta').hidden = true;
+      await carregarAlertas();
+    } catch (err) {
+      mostrarErroAlerta(`Não foi possível ${existente ? 'remover' : 'criar'} o alerta: ${err.message}`);
+    } finally {
+      b.disabled = false;
+    }
+  });
+  $('#alertas').addEventListener('click', async (e) => {
+    const remover = e.target.closest('button.remover');
+    if (remover) {
+      remover.disabled = true;
+      try {
+        await apiGravar('DELETE', `/api/alertas/${remover.dataset.id}`);
+        await carregarAlertas();
+      } catch (err) {
+        remover.disabled = false;
+        mostrarErroAlerta(`Não foi possível remover o alerta: ${err.message}`);
+      }
+      return;
+    }
+    const ir = e.target.closest('button.ir');
+    if (ir && ir.dataset.simbolo !== (estado.grafico && estado.grafico.simbolo)) trocar({ simbolo: ir.dataset.simbolo });
+  });
+  $('#limpar-alertas').addEventListener('click', async () => {
+    try {
+      await apiGravar('POST', '/api/alertas/limpar', {});
+      await carregarAlertas();
+    } catch (err) {
+      mostrarErroAlerta(`Não foi possível limpar: ${err.message}`);
+    }
+  });
+
+  // Alertas ativos do símbolo do gráfico, como linhas de preço.
+  let linhasAlertas = [];
+  let assinaturaLinhasAlertas = '';
+  function desenharAlertas() {
+    const d = estado.grafico;
+    const linhas = d && estado.camadas.alertas
+      ? ativos().filter((a) => a.simbolo === d.simbolo).map((a) => ({ price: a.preco, title: 'Alerta' }))
+      : [];
+    const assinatura = JSON.stringify(linhas);
+    if (assinatura === assinaturaLinhasAlertas) return;
+    assinaturaLinhasAlertas = assinatura;
+    for (const l of linhasAlertas) velas.removePriceLine(l);
+    linhasAlertas = linhas.map((l) => velas.createPriceLine({
+      ...l, color: COR.destaque, lineWidth: 1, lineStyle: LW.LineStyle.Dotted, axisLabelVisible: true,
+    }));
   }
 
   // ------------------------------------------------------------------ journal
@@ -1185,6 +1352,7 @@
     atualizarUrl();
     camadaSmc.atualizar(null);
     desenharNiveis();
+    desenharAlertas();
     carregarGrafico();
     carregarEstrutura();
     aoVivo();
@@ -1204,6 +1372,7 @@
     grafico.applyOptions(formatadores());
     if (estado.estrutura) { renderSessoes(estado.estrutura); renderDiaSemana(estado.estrutura); }
     if (estado.journal.dados) renderJournal(estado.journal.dados);
+    if (estado.alertas) renderAlertas(estado.alertas);
     legenda(estado.velas[estado.velas.length - 1]);
   });
   $('#camadas').addEventListener('click', (e) => {
@@ -1215,6 +1384,7 @@
     camadaSmc.atualizar(estado.grafico);
     desenharNiveis();
     desenharPosicoes();
+    desenharAlertas();
   });
   $('#form-simbolo').addEventListener('submit', (e) => {
     e.preventDefault();
@@ -1231,7 +1401,7 @@
     if (n >= 1 && n <= TIMEFRAMES.length && TIMEFRAMES[n - 1] !== estado.tf) trocar({ tf: TIMEFRAMES[n - 1] });
   });
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) { aoVivo(); carregarRisco(); carregarGrafico({ manterVista: true }); }
+    if (!document.hidden) { aoVivo(); carregarRisco(); carregarAlertas(); carregarGrafico({ manterVista: true }); }
   });
 
   // ------------------------------------------------------------------ início
@@ -1244,6 +1414,7 @@
       $('#lista-simbolos').innerHTML = cfg.instrumentos.map((s) => `<option value="${esc(s)}"></option>`).join('');
     } catch { /* sem a lista, o campo continua aceitando qualquer símbolo */ }
     carregarRisco();  // antes da estrutura, que é lenta e disputa a mesma conexão com o MT5
+    carregarAlertas();
     trocar();
     if (estado.vista === 'journal') mostrarVista('journal');
   })();

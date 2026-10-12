@@ -78,6 +78,14 @@
         <div id="posicoes"><p class="sutil">Carregando…</p></div>
       </section>
 
+      <section class="secao" aria-labelledby="titulo-alertas">
+        <h2 id="titulo-alertas">Alertas <span class="sutil" id="contagem-alertas"></span></h2>
+        <p class="aviso-vigia" id="aviso-vigia" role="status" hidden></p>
+        <p class="erro-alerta" id="erro-alerta" role="alert" hidden></p>
+        <ul class="lista-alertas" id="alertas"><li class="sutil">Carregando…</li></ul>
+        <button type="button" class="botao pequeno" id="limpar-alertas" hidden>Limpar disparados</button>
+      </section>
+
       <section class="secao">
         <h2>Estrutura <span class="sutil">por fechamento</span></h2>
         <table class="tabela" id="tabela-estrutura">
@@ -94,7 +102,7 @@
 
       <section class="secao">
         <h2>Alvos de liquidez</h2>
-        <p class="nota">Onde o preço costuma reagir, não previsão. Passe o mouse para ver no gráfico.</p>
+        <p class="nota">Onde o preço costuma reagir, não previsão. Passe o mouse para ver no gráfico; o sino cria um alerta no nível.</p>
         <ol class="escada" id="alvos"><li class="sutil">Carregando…</li></ol>
       </section>
 

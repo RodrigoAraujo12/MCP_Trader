@@ -263,6 +263,38 @@ body[data-vista="journal"] .cotacao { display: none; }
 .posicao .det b { font-weight: 500; color: var(--text-2); }
 .posicao .alerta { grid-column: 1 / -1; font-size: 12px; color: var(--warn); }
 
+/* ------------------------------------------------------------------ alertas */
+.lista-alertas { list-style: none; margin: 0; padding: 0; }
+.lista-alertas > li.sutil { font-size: 13px; }
+.alerta-item { display: flex; align-items: flex-start; gap: 4px; margin: 0 -8px; border-radius: var(--radius); }
+.alerta-item.disparado { box-shadow: inset 2px 0 0 var(--warn); }
+.alerta-item .ir {
+  flex: 1; min-width: 0; display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; align-items: baseline;
+  padding: 7px 8px; text-align: left; background: transparent; border: 0; border-radius: var(--radius);
+  transition: background-color 150ms var(--ease);
+}
+.alerta-item .ir:hover { background: var(--surface-2); }
+.alerta-item .sim { font-family: var(--mono); font-weight: 600; font-size: 13px; }
+.alerta-item .p { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 13px; text-align: right; }
+.alerta-item .t, .alerta-item .quando { grid-column: 1 / -1; font-size: 12px; color: var(--text-muted); overflow-wrap: anywhere; }
+.alerta-item.disparado .quando { color: var(--warn); }
+.alerta-item .remover {
+  flex: none; width: 28px; height: 28px; margin-top: 4px; display: grid; place-items: center;
+  background: transparent; border: 0; border-radius: var(--radius); color: var(--text-muted); font-size: 16px; line-height: 1;
+  transition: background-color 150ms var(--ease), color 150ms var(--ease);
+}
+.alerta-item .remover:hover { background: var(--surface-2); color: var(--text); }
+@media (prefers-reduced-motion: no-preference) {
+  .alerta-item.novo { animation: disparou 1.2s var(--ease) 2; }
+}
+@keyframes disparou { 0%, 100% { background: transparent; } 40% { background: rgba(224, 165, 38, 0.18); } }
+.aviso-vigia { margin: -4px 0 10px; font-size: 12.5px; color: var(--warn); text-wrap: pretty; }
+.erro-alerta {
+  margin: -4px 0 10px; padding: 6px 10px; border: 1px solid var(--bear); border-radius: var(--radius);
+  background: var(--surface-3); font-size: 13px;
+}
+.botao.pequeno { height: 30px; margin-top: 8px; padding: 0 12px; font-size: 12.5px; }
+
 /* ------------------------------------------------------------------ área principal */
 .area {
   display: grid;
@@ -352,10 +384,19 @@ body[data-vista="journal"] .cotacao { display: none; }
 
 .escada { list-style: none; margin: 0; padding: 0; font-size: 13px; }
 .escada li.alvo {
-  display: grid; grid-template-columns: auto 1fr; gap: 0 12px; align-items: baseline;
+  display: grid; grid-template-columns: auto 1fr auto; gap: 0 12px; align-items: baseline;
   padding: 6px 8px; margin: 0 -8px; border-radius: var(--radius); cursor: default;
   transition: background-color 150ms var(--ease);
 }
+.escada .sino {
+  align-self: center; width: 28px; height: 28px; margin: -4px -4px -4px 0; display: grid; place-items: center;
+  background: transparent; border: 0; border-radius: var(--radius); color: var(--text-muted);
+  transition: background-color 150ms var(--ease), color 150ms var(--ease);
+}
+.escada .sino:hover { background: var(--surface-3); color: var(--text); }
+.escada .sino[aria-pressed="true"] { color: var(--accent); }
+.escada .sino[aria-pressed="true"] svg { fill: currentColor; }
+.escada .sino:disabled { opacity: 0.5; cursor: progress; }
 .escada li.alvo:hover, .escada li.alvo:focus-visible { background: var(--surface-2); }
 .escada .p { font-family: var(--mono); font-variant-numeric: tabular-nums; color: var(--text); }
 .escada .d { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 12px; text-align: right; color: var(--text-muted); }

@@ -1,20 +1,24 @@
-"""Aplicação web do painel (Starlette): página estática e uma API JSON só de leitura.
+"""Aplicação web do painel (Starlette): página estática e uma API JSON de leitura; só grava a lista de alertas.
 
 Nada aqui envia, altera ou cancela ordens, nem grava no journal: a execução continua só pelo chat, com a aprovação na
 janela do Windows. Um botão "Enviar" numa página local poderia ser acionado por qualquer programa do PC (inclusive o
-próprio Claude, por um navegador ou curl), o que anularia a garantia da janela de aprovação.
+próprio Claude, por um navegador ou curl), o que anularia a garantia da janela de aprovação. Alertas não mexem na
+conta: o pior que um pedido de fora faria é criar ou apagar um aviso. Mesmo assim, só a página do painel grava
+(veja ``_write_refusal``).
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 from starlette.applications import Starlette
+from starlette.concurrency import run_in_threadpool
 from starlette.middleware import Middleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import Request
@@ -22,7 +26,7 @@ from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
-from trading_mcp import journal as journal_module, limites, smc, tempo
+from trading_mcp import alertas, journal as journal_module, limites, smc, tempo
 from trading_mcp.config import Settings
 from trading_mcp.journal import Journal, JournalError
 from trading_mcp.mt5_client import MT5Client, MT5Error, SymbolNotFoundError
@@ -78,30 +82,72 @@ def _days(request: Request) -> float | None:
     return days
 
 
+class _NotFound(Exception):
+    pass
+
+
+def _write_refusal(request: Request) -> str | None:
+    """Motivo para recusar uma gravação que não veio da página do painel; None se veio.
+
+    O cabeçalho X-Painel obriga o navegador a pedir licença (CORS) antes de mandar o pedido de outro site, e o painel
+    nunca dá essa licença. Origin e Sec-Fetch-Site, quando o navegador os manda, também têm de ser do painel.
+    """
+    refused = "Pedido recusado: só a página do painel cria ou apaga alertas."
+    if request.headers.get("x-painel") != "1":
+        return refused
+    origin = request.headers.get("origin")
+    if origin is not None and origin != f"http://{request.headers.get('host', '')}":
+        return refused
+    if request.headers.get("sec-fetch-site", "same-origin") not in ("same-origin", "none"):
+        return refused
+    if request.method == "POST" and not request.headers.get("content-type", "").startswith("application/json"):
+        return refused
+    return None
+
+
 # Campos de cada operação que a tela do journal usa (o journal_listar do chat traz mais).
 _OPERATION_FIELDS = ("id", "ticket", "simbolo", "direcao", "abertura", "fechamento", "duracao", "volume",
                      "preco_entrada", "preco_saida", "resultado_liquido", "r", "setup", "tags", "noticia",
                      "fechamento_motivo", "contexto")
 
 
-def create_app(settings: Settings, mt5: MT5Client, journal: Journal | None = None) -> Starlette:
+def create_app(settings: Settings, mt5: MT5Client, journal: Journal | None = None,
+               alerts: alertas.AlertStore | None = None, vigia: alertas.Vigia | None = None) -> Starlette:
+    """``vigia``: quem confere os alertas (o __main__ o roda); sem ele, a tela avisa que ninguém está vigiando."""
     rules = limites.RiskRules(settings.risk_per_trade_pct, settings.daily_loss_pct, settings.weekly_loss_pct)
     # Só leitura: sem calendário nem medição de contexto, que só a sincronização (pelo chat) usa.
     journal = journal or Journal(settings.journal_path, settings.journal_export_dir, mt5)
+    alerts = alerts or alertas.AlertStore(settings.alertas_path)
 
     def handle(func):  # noqa: ANN001, ANN202
         def endpoint(request: Request) -> JSONResponse:
             try:
                 return _json(func(request))
-            except SymbolNotFoundError as exc:
+            except (SymbolNotFoundError, _NotFound) as exc:
                 return _json({"erro": str(exc)}, 404)
             except ValueError as exc:
                 return _json({"erro": str(exc)}, 400)
             except MT5Error as exc:
                 return _json({"erro": str(exc)}, 502)
+            except alertas.AlertasError as exc:
+                return _json({"erro": str(exc)}, 500)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Erro inesperado no painel")
                 return _json({"erro": f"Erro inesperado ({type(exc).__name__}): {exc}"}, 500)
+
+        return endpoint
+
+    def handle_write(func: Callable[[Request, Any], Any]):  # noqa: ANN202
+        async def endpoint(request: Request) -> JSONResponse:
+            refusal = _write_refusal(request)
+            if refusal:
+                return _json({"erro": refusal}, 403)
+            raw = await request.body()
+            try:
+                body = json.loads(raw) if raw else None
+            except ValueError:
+                return _json({"erro": "Corpo do pedido não é JSON válido."}, 400)
+            return await run_in_threadpool(handle(lambda r: func(r, body)), request)
 
         return endpoint
 
@@ -172,6 +218,24 @@ def create_app(settings: Settings, mt5: MT5Client, journal: Journal | None = Non
             "agora": tempo.iso_utc(mt5.now_utc()),
         }
 
+    def alerts_view(request: Request) -> dict[str, Any]:
+        return {"alertas": [alertas.public(a) for a in alerts.all()], "vigia": vigia.status() if vigia else None}
+
+    def alert_create(request: Request, body: Any) -> dict[str, Any]:
+        if not isinstance(body, dict):
+            raise ValueError("Mande o alerta como JSON: {\"simbolo\", \"preco\", \"titulo\"}.")
+        alert, created = alertas.create_alert(alerts, mt5, body.get("simbolo"), body.get("preco"), body.get("titulo"))
+        return {"alerta": alertas.public(alert), "criado": created}
+
+    def alert_delete(request: Request, body: Any) -> dict[str, Any]:
+        alert_id = request.path_params["id"]
+        if not alerts.delete(alert_id):
+            raise _NotFound(f"Alerta {alert_id} não encontrado.")
+        return {"removido": alert_id}
+
+    def alerts_clear(request: Request, body: Any) -> dict[str, Any]:
+        return {"removidos": alerts.clear_fired()}
+
     def index(request: Request) -> FileResponse:
         return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-store"})
 
@@ -183,6 +247,10 @@ def create_app(settings: Settings, mt5: MT5Client, journal: Journal | None = Non
         Route("/api/ao_vivo", handle(live)),
         Route("/api/risco", handle(risk)),
         Route("/api/journal", handle(journal_view)),
+        Route("/api/alertas", handle(alerts_view), methods=["GET"]),
+        Route("/api/alertas", handle_write(alert_create), methods=["POST"]),
+        Route("/api/alertas/limpar", handle_write(alerts_clear), methods=["POST"]),
+        Route("/api/alertas/{id:int}", handle_write(alert_delete), methods=["DELETE"]),
         Mount("/static", StaticFiles(directory=STATIC_DIR), name="static"),
     ]
     return Starlette(routes=routes, middleware=[Middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)])

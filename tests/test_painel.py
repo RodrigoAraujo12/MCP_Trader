@@ -214,13 +214,14 @@ def test_api_only_answers_on_localhost(api):
     assert other.get("/api/config").status_code == 400
 
 
-def test_api_has_no_write_routes():
-    """O painel só lê: enviar ordem continua só pelo chat, com a janela de aprovação do Windows."""
+def test_api_only_writes_alerts():
+    """O painel só grava alertas: enviar ordem continua só pelo chat, com a janela de aprovação do Windows."""
     client, _ = _index_client(500)
     app = painel_app.create_app(Settings(), client)
-    for route in app.routes:
-        methods = getattr(route, "methods", None)
-        assert methods is None or methods <= {"GET", "HEAD"}, route.path
+    writes = {(route.path, frozenset(route.methods - {"HEAD"})) for route in app.routes
+              if getattr(route, "methods", None) and not route.methods <= {"GET", "HEAD"}}
+    assert writes == {("/api/alertas", frozenset({"POST"})), ("/api/alertas/limpar", frozenset({"POST"})),
+                      ("/api/alertas/{id:int}", frozenset({"DELETE"}))}
 
 
 def test_json_is_valid_for_the_browser():

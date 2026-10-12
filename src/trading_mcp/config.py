@@ -20,6 +20,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_JOURNAL_PATH = Path.home() / "trading-mcp" / "journal.sqlite3"
 DEFAULT_REACOES_PATH = Path.home() / "trading-mcp" / "reacoes.sqlite3"
 DEFAULT_PROPOSTAS_PATH = Path.home() / "trading-mcp" / "propostas.sqlite3"
+DEFAULT_ALERTAS_PATH = Path.home() / "trading-mcp" / "alertas.sqlite3"
 # Arquivo que, na pasta do banco das propostas, bloqueia toda execução de ordens (só o usuário o apaga).
 KILL_FILE_NAME = "PARAR_EXECUCOES"
 # Regras de risco do usuário: % do saldo do início do dia (por operação e por dia) e da semana de mercado.
@@ -134,6 +135,8 @@ class Settings:
     weekly_loss_pct: float = DEFAULT_WEEKLY_LOSS_PCT
     # Execução de propostas (etapa F): desligada por padrão; só na conta demo e com aprovação do usuário numa janela.
     execution_enabled: bool = False
+    # Alertas de preço do painel (etapa G4), no mesmo lugar do journal.
+    alertas_path: Path = DEFAULT_ALERTAS_PATH
     # Arquivo .env efetivamente usado (None = nenhum encontrado).
     env_file: str | None = None
     # Problemas encontrados na configuração do MT5.
@@ -209,6 +212,7 @@ def load_settings(env_file: Path | None = None) -> Settings:
         daily_loss_pct=daily,
         weekly_loss_pct=weekly,
         execution_enabled=execution_enabled,
+        alertas_path=_get_path(env, "ALERTAS_PATH", DEFAULT_ALERTAS_PATH),
         env_file=str(env_file) if env_file.is_file() else None,
         errors=tuple(errors),
     )
